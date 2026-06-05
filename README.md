@@ -1,4 +1,4 @@
-# pls - a Polite Little Semaphore
+# 🙏 pls - a Polite Little Semaphore
 
 A tiny, dependency-free lease broker for **one shared resource**. Everything that wants the
 resource asks `pls` _before_ using it and releases when done; `pls` keeps a list of tickets in
