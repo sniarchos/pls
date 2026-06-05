@@ -1,0 +1,142 @@
+"""Broker tests: scheduling/admission/reaper logic + the HTTP endpoints."""
+import os
+import sys
+import time
+import unittest
+import uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+for _p in (HERE, os.path.join(ROOT, "server"), os.path.join(ROOT, "client")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import app  # noqa: E402
+from _helpers import start_broker, post, get  # noqa: E402
+
+
+def _add(state="waiting", priority="normal", created_at=None, cost=0.0,
+         last_seen=None, granted_at=None, ended_at=None):
+    now = time.time()
+    t = {
+        "id": uuid.uuid4().hex[:12], "user": "u", "tool": "t", "cost": cost,
+        "priority": app.PRIORITIES[priority], "priority_name": priority, "state": state,
+        "created_at": created_at if created_at is not None else now,
+        "granted_at": granted_at,
+        "last_seen": last_seen if last_seen is not None else now,
+    }
+    if ended_at is not None:
+        t["ended_at"] = ended_at
+    app._tickets[t["id"]] = t
+    return t
+
+
+class SchedulingTests(unittest.TestCase):
+    def setUp(self):
+        app._tickets.clear()
+        app.CAPACITY, app.BUDGET = 1, 0.0
+        app.HEARTBEAT_TTL, app.DONE_RETAIN = 30.0, 600.0
+
+    def test_capacity_one_serializes(self):
+        _add()
+        _add()
+        app._schedule()
+        self.assertEqual(len(app._held()), 1)
+        self.assertEqual(len(app._waiting()), 1)
+
+    def test_priority_then_fifo(self):
+        app.CAPACITY = 0  # admit nothing, just inspect ordering
+        _add(priority="normal", created_at=100)
+        _add(priority="low", created_at=50)
+        _add(priority="high", created_at=200)
+        _add(priority="normal", created_at=80)
+        order = [(t["priority_name"], t["created_at"]) for t in app._waiting()]
+        self.assertEqual(
+            order, [("high", 200), ("normal", 80), ("normal", 100), ("low", 50)]
+        )
+
+    def test_budget_admission_is_additive(self):
+        app.CAPACITY, app.BUDGET = 5, 40.0
+        _add(cost=24, created_at=1)
+        _add(cost=20, created_at=2)
+        _add(cost=10, created_at=3)
+        app._schedule()
+        held_costs = sorted(t["cost"] for t in app._held())
+        self.assertEqual(held_costs, [10, 24])             # 24 then 10 fit (34 <= 40); 20 skipped
+        self.assertEqual([t["cost"] for t in app._waiting()], [20])
+
+    def test_priority_is_not_preemptive(self):
+        held = _add(state="held", granted_at=time.time())
+        _add(priority="high")
+        app._schedule()
+        self.assertEqual(app._tickets[held["id"]]["state"], "held")  # holder keeps the resource
+        self.assertEqual(len(app._waiting()), 1)                     # high priority still waits
+
+    def test_done_holder_frees_slot(self):
+        held = _add(state="held", granted_at=time.time())
+        waiter = _add()
+        app._tickets[held["id"]]["state"] = "done"   # mimic a release
+        app._schedule()
+        self.assertEqual(app._tickets[waiter["id"]]["state"], "held")
+
+    def test_reaper_expires_stale_holder_and_promotes(self):
+        stale = _add(state="held", granted_at=time.time(), last_seen=time.time() - 31)
+        waiter = _add()
+        app._reap()
+        self.assertEqual(app._tickets[stale["id"]]["state"], "done")
+        self.assertTrue(app._tickets[stale["id"]].get("reaped"))
+        self.assertEqual(app._tickets[waiter["id"]]["state"], "held")
+
+    def test_reaper_gc_old_done_tickets(self):
+        gone = _add(state="done", ended_at=time.time() - 601)
+        app._reap()
+        self.assertNotIn(gone["id"], app._tickets)
+
+    def test_state_of_reports_queue_position(self):
+        app.CAPACITY = 0
+        _add(created_at=1)
+        second = _add(created_at=2)
+        st = app._state_of(second)
+        self.assertEqual(st["position"], 2)
+        self.assertEqual(st["ahead"], 1)
+
+
+class HttpTests(unittest.TestCase):
+    def setUp(self):
+        self.httpd, self.url = start_broker(app, capacity=1)
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_healthz(self):
+        self.assertEqual(get(self.url, "/healthz"), {"ok": True})
+
+    def test_acquire_held_then_waiting(self):
+        a = post(self.url, "/acquire", {"user": "a", "tool": "A", "cost": 0, "priority": "normal"})
+        b = post(self.url, "/acquire", {"user": "b", "tool": "B", "cost": 0, "priority": "normal"})
+        self.assertEqual(a["state"], "held")
+        self.assertEqual(b["state"], "waiting")
+        self.assertEqual(b["position"], 1)
+
+    def test_status_shape(self):
+        post(self.url, "/acquire", {"user": "a", "tool": "A", "cost": 7, "priority": "normal"})
+        s = get(self.url, "/status")
+        self.assertEqual(set(s), {"label", "unit", "capacity", "budget", "held", "waiting"})
+        self.assertEqual(len(s["held"]), 1)
+        self.assertEqual(s["held"][0]["cost"], 7.0)
+
+    def test_release_reschedules_next(self):
+        a = post(self.url, "/acquire", {"user": "a", "tool": "A", "cost": 0, "priority": "normal"})
+        b = post(self.url, "/acquire", {"user": "b", "tool": "B", "cost": 0, "priority": "normal"})
+        post(self.url, "/release/" + a["id"])
+        held = get(self.url, "/status")["held"]
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["id"], b["id"])
+
+    def test_heartbeat_unknown_ticket_is_expired(self):
+        self.assertEqual(post(self.url, "/heartbeat/deadbeef")["state"], "expired")
+
+
+if __name__ == "__main__":
+    unittest.main()

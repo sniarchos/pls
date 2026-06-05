@@ -1,0 +1,6 @@
+# machine-specific config (ship .env.example instead)
+.env
+
+# python
+**/__pycache__/
+*.py[cod]

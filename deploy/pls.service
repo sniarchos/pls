@@ -1,0 +1,27 @@
+[Unit]
+Description=pls - Polite Little Semaphore (single-resource lease broker)
+Documentation=file:/opt/pls/README.md
+After=network-online.target
+Wants=network-online.target
+# Deliberately NOT "After=docker.service": the broker must outlive Docker & apps, and must
+# keep arbitrating even while they restart.
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/usr/bin/python3 /opt/pls/server/app.py
+# All configuration lives in /opt/pls/.env (the app loads it on startup, real env vars winning).
+# Edit that file then `systemctl restart pls`. See /opt/pls/.env.example for every variable.
+Restart=always
+RestartSec=2
+
+# --- light hardening (the broker writes nothing to disk; pure in-memory state) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
