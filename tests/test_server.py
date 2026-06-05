@@ -17,7 +17,7 @@ from _helpers import start_broker, post, get  # noqa: E402
 
 def _add(state="waiting", priority="normal", created_at=None, cost=0.0,
          last_seen=None, granted_at=None, ended_at=None):
-    now = time.time()
+    now = time.monotonic_ns()
     t = {
         "id": uuid.uuid4().hex[:12], "user": "u", "tool": "t", "cost": cost,
         "priority": app.PRIORITIES[priority], "priority_name": priority, "state": state,
@@ -66,21 +66,21 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual([t["cost"] for t in app._waiting()], [20])
 
     def test_priority_is_not_preemptive(self):
-        held = _add(state="held", granted_at=time.time())
+        held = _add(state="held", granted_at=time.monotonic_ns())
         _add(priority="high")
         app._schedule()
         self.assertEqual(app._tickets[held["id"]]["state"], "held")  # holder keeps the resource
         self.assertEqual(len(app._waiting()), 1)                     # high priority still waits
 
     def test_done_holder_frees_slot(self):
-        held = _add(state="held", granted_at=time.time())
+        held = _add(state="held", granted_at=time.monotonic_ns())
         waiter = _add()
         app._tickets[held["id"]]["state"] = "done"   # mimic a release
         app._schedule()
         self.assertEqual(app._tickets[waiter["id"]]["state"], "held")
 
     def test_reaper_expires_stale_holder_and_promotes(self):
-        stale = _add(state="held", granted_at=time.time(), last_seen=time.time() - 31)
+        stale = _add(state="held", granted_at=time.monotonic_ns(), last_seen=time.monotonic_ns() - 31_000_000_000)
         waiter = _add()
         app._reap()
         self.assertEqual(app._tickets[stale["id"]]["state"], "done")
@@ -88,7 +88,7 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(app._tickets[waiter["id"]]["state"], "held")
 
     def test_reaper_gc_old_done_tickets(self):
-        gone = _add(state="done", ended_at=time.time() - 601)
+        gone = _add(state="done", ended_at=time.monotonic_ns() - 601_000_000_000)
         app._reap()
         self.assertNotIn(gone["id"], app._tickets)
 

@@ -57,6 +57,7 @@ PLS_URL = os.getenv("PLS_URL", f"http://127.0.0.1:{_PORT}")
 _POLL = float(os.getenv("PLS_POLL", "2"))
 _BEAT = float(os.getenv("PLS_BEAT", "10"))
 _GRACE = float(os.getenv("PLS_CONNECT_GRACE", "15"))
+_GRACE_NS = int(_GRACE * 1_000_000_000)
 _REQUIRED = os.getenv("PLS_REQUIRED", "false").lower() in ("1", "true", "yes")
 
 
@@ -78,7 +79,7 @@ def _acquire(user, tool, cost, priority):
 def _acquire_resilient(user, tool, cost, priority):
     """Acquire a ticket, tolerating a broker that is briefly down. Returns the ticket, or
     ``None`` to signal "run unguarded" (only when the broker is optional)."""
-    deadline = time.time() + _GRACE
+    deadline = time.monotonic_ns() + _GRACE_NS
     while True:
         try:
             return _acquire(user, tool, cost, priority)
@@ -86,7 +87,7 @@ def _acquire_resilient(user, tool, cost, priority):
             if _REQUIRED:
                 time.sleep(2)
                 continue
-            if time.time() > deadline:
+            if time.monotonic_ns() > deadline:
                 sys.stderr.write(
                     f"[pls] WARNING: broker unreachable ({exc}); running WITHOUT a lease\n"
                 )

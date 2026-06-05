@@ -71,6 +71,9 @@ CAPACITY = int(os.getenv("PLS_CAPACITY", "1"))               # max concurrent ho
 BUDGET = float(os.getenv("PLS_BUDGET", "0"))                 # 0 = ignore cost, gate on CAPACITY only
 HEARTBEAT_TTL = float(os.getenv("PLS_HEARTBEAT_TTL", "30"))  # silence -> reaped
 DONE_RETAIN = float(os.getenv("PLS_DONE_RETAIN", "600"))     # keep finished tickets this long
+_NS = 1_000_000_000
+_HEARTBEAT_TTL_NS = int(HEARTBEAT_TTL * _NS)
+_DONE_RETAIN_NS = int(DONE_RETAIN * _NS)
 LABEL = os.getenv("PLS_LABEL", "shared resource")            # headline shown on the status page
 UNIT = os.getenv("PLS_UNIT", "")                             # cost unit suffix, e.g. "GB"
 PRIORITIES = {"high": 0, "normal": 10, "low": 20}            # lower = served first
@@ -81,7 +84,7 @@ _tickets = {}  # id -> ticket dict
 
 
 def _now():
-    return time.time()
+    return time.monotonic_ns()
 
 
 def _held():
@@ -119,13 +122,13 @@ def _schedule():
 def _reap():
     now = _now()
     for t in list(_tickets.values()):
-        if t["state"] in ("waiting", "held") and now - t["last_seen"] > HEARTBEAT_TTL:
+        if t["state"] in ("waiting", "held") and now - t["last_seen"] > _HEARTBEAT_TTL_NS:
             t["state"] = "done"
             t["reaped"] = True
             t["ended_at"] = now
     _schedule()
     for tid in [tid for tid, t in _tickets.items()
-                if t["state"] == "done" and now - t.get("ended_at", now) > DONE_RETAIN]:
+                if t["state"] == "done" and now - t.get("ended_at", now) > _DONE_RETAIN_NS]:
         del _tickets[tid]
 
 
@@ -151,12 +154,12 @@ def _status_payload():
         "budget": BUDGET,
         "held": [
             {"id": t["id"], "user": t["user"], "tool": t["tool"], "cost": t["cost"],
-             "held_s": round(now - t["granted_at"]) if t.get("granted_at") else 0}
+             "held_s": (now - t["granted_at"]) // _NS if t.get("granted_at") else 0}
             for t in _held()
         ],
         "waiting": [
             {"id": t["id"], "user": t["user"], "tool": t["tool"],
-             "priority": t["priority_name"], "waited_s": round(now - t["created_at"])}
+             "priority": t["priority_name"], "waited_s": (now - t["created_at"]) // _NS}
             for t in _waiting()
         ],
     }
