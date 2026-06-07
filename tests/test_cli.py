@@ -1,4 +1,4 @@
-"""CLI tests: helpers (_fmt/_clip) and end-to-end `pls run` through the real entrypoint."""
+"""CLI tests: helpers (_fmt) and end-to-end `pls run` through the real entrypoint."""
 import importlib.machinery
 import importlib.util
 import os
@@ -36,12 +36,6 @@ class CliHelperTests(unittest.TestCase):
         self.assertEqual(self.cli._fmt(59), "59s")
         self.assertEqual(self.cli._fmt(60), "1m00s")
         self.assertEqual(self.cli._fmt(3661), "1h01m")
-
-    def test_clip(self):
-        self.assertEqual(self.cli._clip("short"), "short")
-        clipped = self.cli._clip("x" * 80)
-        self.assertEqual(len(clipped), 36)
-        self.assertTrue(clipped.endswith("…"))
 
 
 class CliRunTests(unittest.TestCase):

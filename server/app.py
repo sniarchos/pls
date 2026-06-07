@@ -7,7 +7,7 @@ resource and release when done; the broker just keeps a list of tickets in memor
 who goes next. It never touches the resource itself.
 
 The resource is generic. "cost" is whatever additive quantity a job consumes (GPU VRAM in GB,
-RAM, seats, credits…); set ``PLS_BUDGET`` to cap the running total, or leave it 0 to gate purely
+RAM, seats, credits...); set ``PLS_BUDGET`` to cap the running total, or leave it 0 to gate purely
 on ``PLS_CAPACITY`` (a plain N-slot lock). GPU sharing is the flagship use case (see the README).
 
 Design notes
@@ -304,9 +304,7 @@ _PAGE = """<!doctype html>
   tbody tr:nth-child(even){background:var(--row);}
   .u{font-weight:600;}
   .tool{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.85rem;
-        display:inline-block; max-width:34ch; overflow:hidden; text-overflow:ellipsis;
-        white-space:nowrap; vertical-align:bottom; cursor:pointer;}
-  .tool.expanded{max-width:none; overflow:visible; white-space:normal; word-break:break-all;}
+        word-break:break-all;}
   .num{font-variant-numeric:tabular-nums; color:var(--muted);}
   .pos{display:inline-flex; align-items:center; justify-content:center; min-width:1.45rem;
        height:1.45rem; border-radius:7px; background:var(--head); color:var(--muted);
@@ -351,10 +349,7 @@ const el = (tag, cls, txt) => {
 };
 const tdTool = name => {
   const td = el("td");
-  const s = el("span", "tool", name);
-  s.title = name;  // full command on hover
-  s.addEventListener("click", () => s.classList.toggle("expanded"));  // click to expand/collapse
-  td.append(s);
+  td.append(el("span", "tool", name));
   return td;
 };
 
@@ -408,7 +403,7 @@ async function tick() {
     document.getElementById("ts").textContent = new Date().toLocaleTimeString();
   } catch (e) {
     dot.classList.add("stale");
-    document.getElementById("sub").textContent = "broker unreachable…";
+    document.getElementById("sub").textContent = "broker unreachable...";
   }
 }
 tick();

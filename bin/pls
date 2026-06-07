@@ -40,11 +40,6 @@ def _fmt(secs):
     return f"{h}h{m:02d}m"
 
 
-def _clip(text, n=36):
-    text = str(text)
-    return text if len(text) <= n else text[: n - 1] + "…"
-
-
 def _print_status(s):
     cap = s.get("capacity", 1)
     unit = s.get("unit", "")
@@ -55,12 +50,12 @@ def _print_status(s):
     if held:
         for h in held:
             cost = (f"  ~{h['cost']}{(' ' + unit) if unit else ''}") if h.get("cost") else ""
-            print(f"  IN USE   {h['user']:<12} {_clip(h['tool']):<38} {_fmt(h['held_s'])}{cost}")
+            print(f"  IN USE   {h['user']:<12} {h['tool']:<38} {_fmt(h['held_s'])}{cost}")
     else:
         print("  IN USE   (free)")
     if waiting:
         for i, w in enumerate(waiting, 1):
-            print(f"  WAIT #{i:<2} {w['user']:<12} {_clip(w['tool']):<38} {w['priority']:<12} ({_fmt(w['waited_s'])})")
+            print(f"  WAIT #{i:<2} {w['user']:<12} {w['tool']:<38} {w['priority']:<12} ({_fmt(w['waited_s'])})")
     else:
         print("  WAIT     (nobody)")
 
@@ -99,8 +94,6 @@ def cmd_run(args, cmd):
     if not cmd:
         print("error: no command given (put it after `--`)", file=sys.stderr)
         return 2
-    # Default label is the whole command; the web view truncates it and lets you click to
-    # expand. shlex.quote keeps it copy-pasteable.
     tool = args.tool or " ".join(shlex.quote(c) for c in cmd)
     last = {"pos": None}
 
@@ -108,7 +101,7 @@ def cmd_run(args, cmd):
         pos = state.get("position")
         if pos and pos != last["pos"]:
             last["pos"] = pos
-            sys.stderr.write(f"\r[pls] queued - position {pos} …          ")
+            sys.stderr.write(f"\r[pls] queued - position {pos} ...        ")
             sys.stderr.flush()
 
     with lease_sync(tool=tool, cost=args.cost, priority=args.prio,

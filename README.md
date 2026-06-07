@@ -114,8 +114,7 @@ pls watch [--interval S]
   is set; then it gates co-residency. Default `0`.
 - `--prio`: serving order is `high`, then `normal`, then `low`. Orders the **waiting** queue (priority, then
   FIFO). Non-preemptive ie, it never bumps a job that's already holding. Default `normal`.
-- `--tool`: the label shown on the board. Defaults to the **full command** (truncated with `...`
-  in the web view; click to expand).
+- `--tool`: the label shown on the board. Defaults to the **full command**.
 
 ## Embedding in your app
 
