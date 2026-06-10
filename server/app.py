@@ -278,7 +278,7 @@ _PAGE = """<!doctype html>
   body{margin:0; background:var(--bg); color:var(--text);
        font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
        -webkit-font-smoothing:antialiased;}
-  .wrap{max-width:760px; margin:0 auto; padding:2.2rem 1.4rem 4rem;}
+  .wrap{max-width:80%; margin:0 auto; padding:2.2rem 1.4rem 4rem;}
   header{display:flex; align-items:baseline; justify-content:space-between; gap:1rem; flex-wrap:wrap;}
   h1{font-size:1.25rem; font-weight:650; margin:0; display:flex; align-items:center; gap:.55rem;
      letter-spacing:.02em;}
