@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """pls: a command-line client for the Polite Little Semaphore lease broker.
 
-    pls run [--on CARD] [--cost N] [--prio low|normal|high] [--tool L] [--user U] -- CMD...
+    pls run [--on CARD] [--yes] [--cost N] [--prio low|normal|high] [--tool L] [--user U] -- CMD...
         acquire a lease, run CMD once it's granted, release when CMD exits (or on Ctrl-C).
         CARD is any, a card name or a tag (repeatable or comma-separated). A granted card's
         UUID replaces {device} in CMD and is exported as CUDA_VISIBLE_DEVICES and PLS_DEVICE.
+        Without --on, a broker with several cards gets a question first; --yes skips it.
     pls status [--json]
         show who holds each card and who's waiting (the terminal view).
     pls watch [--interval S]
@@ -119,6 +120,11 @@ def cmd_run(args, cmd):
             sys.stderr.write(f"\r[pls] queued - position {pos} ...        ")
             sys.stderr.flush()
 
+    if not args.on and not args.yes:
+        stop = _confirm_default()
+        if stop is not None:
+            return stop
+
     try:
         with lease_sync(tool=tool, cost=args.cost, priority=args.prio, user=args.user,
                         on_wait=on_wait, on=args.on) as grant:
@@ -126,6 +132,42 @@ def cmd_run(args, cmd):
     except PlsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+
+def _confirm_default():
+    """Explain where a job without --on goes and ask. None means go ahead, else an exit code."""
+    try:
+        s = _call("GET", "/status")
+    except Exception:
+        return None  # broker down: lease_sync fails open and says so
+    cards = s.get("cards") or []
+    if len(cards) < 2:
+        return None
+    default = s.get("default") or [c["id"] for c in cards]
+    held, waiting = s.get("held", []), s.get("waiting", [])
+    lines = ["No --on given, so this job would queue for the default "
+             + ("card:" if len(default) == 1 else "cards, whichever frees first:")]
+    for c in cards:
+        if c["id"] not in default:
+            continue
+        users = [f"{h['user']} ({h['tool']})" for h in held if h.get("card") == c["id"]]
+        queued = sum(1 for w in waiting if c["id"] in w.get("eligible", []))
+        lines.append(f"  {c['label']} [{', '.join(c['names'])}]: "
+                     f"{'held by ' + ', '.join(users) if users else 'free'}, {queued} waiting")
+    picks = sorted({t for c in cards for t in c["tags"]})
+    lines.append("To pick, pass --on any, a name ("
+                 + ", ".join(n for c in cards for n in c["names"]) + ")"
+                 + (f" or a tag ({', '.join(picks)})" if picks else "") + ".")
+    sys.stderr.write("".join(f"[pls] {line}\n" for line in lines))
+    if not sys.stdin.isatty():
+        sys.stderr.write("[pls] Nobody can answer here, so not starting: pass --on, or --yes for the default.\n")
+        return 2
+    sys.stderr.write("[pls] Queue for the default? [y/N] ")
+    sys.stderr.flush()
+    if sys.stdin.readline().strip().lower() in ("y", "yes"):
+        return None
+    sys.stderr.write("[pls] Not started.\n")
+    return 1
 
 
 def _launch(cmd, grant, waited):
@@ -168,7 +210,9 @@ def main():
     pr = sub.add_parser("run", help="acquire a lease, run CMD (after --), release")
     pr.add_argument("--on", action="append", default=None, metavar="CARD",
                     help="any, a card name or a tag; repeatable or comma-separated "
-                         "(default: the broker's PLS_DEFAULT)")
+                         "(default: the broker's PLS_DEFAULT, after asking)")
+    pr.add_argument("-y", "--yes", action="store_true",
+                    help="take the default cards without asking")
     pr.add_argument("--cost", type=float, default=0.0, dest="cost",
                     help="estimated resource cost (e.g. GPU VRAM in GB)")
     pr.add_argument("--prio", default="normal",

@@ -9,7 +9,7 @@ by name, by tag or with ``any``. See the README.
   POST /acquire        {user, tool, cost, priority, on} -> {id, state, position, ahead, card}
   POST /heartbeat/<id>                                  -> {id, state, position, ahead, card}
   POST /release/<id>                                    -> {ok}
-  GET  /status                    -> {label, unit, capacity, budget, held, waiting[, cards]}
+  GET  /status          -> {label, unit, capacity, budget, held, waiting[, cards, default]}
   GET  /                                                -> live HTML+JS status page
   GET  /healthz                                         -> {ok}
 """
@@ -314,6 +314,7 @@ def _status_payload():
               "budget": BUDGET, "held": held, "waiting": waiting}
     if cards:
         status["cards"] = [dict(c, capacity=_limits(c)[0], budget=_limits(c)[1]) for c in CARDS]
+        status["default"] = list(DEFAULT)
     return status
 
 

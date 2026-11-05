@@ -240,6 +240,7 @@ class PlacementTests(BrokerCase):
         self.assertEqual([(h["tool"], h["card"]) for h in s["held"]], [("big", "maxq"), ("next", "ada")])
         self.assertEqual(s["waiting"][0]["on"], ["ada"])
         self.assertEqual(s["waiting"][0]["eligible"], ["ada"])
+        self.assertEqual(s["default"], ["ada"])
 
 
 class ThreeCardTests(BrokerCase):
@@ -262,7 +263,7 @@ class SingleCardTests(BrokerCase):
         self.release(a)
         self.assertEqual(self.card_of(b), "ada")
         s = get(self.url, "/status")
-        self.assertEqual(set(s) - {"cards"}, {"label", "unit", "capacity", "budget", "held", "waiting"})
+        self.assertEqual(set(s) - {"cards", "default"}, {"label", "unit", "capacity", "budget", "held", "waiting"})
         self.assertEqual(s["capacity"], 1)
 
     def test_no_cards_keeps_todays_payloads(self):
@@ -271,6 +272,7 @@ class SingleCardTests(BrokerCase):
         self.assertIsNone(a["card"])
         s = get(self.url, "/status")
         self.assertNotIn("cards", s)
+        self.assertNotIn("default", s)
         self.assertEqual(set(s["held"][0]), {"id", "user", "tool", "cost", "held_s"})
         self.assertEqual(set(s["waiting"][0]), {"id", "user", "tool", "priority", "waited_s"})
         with self.assertRaises(urllib.error.HTTPError):
@@ -434,8 +436,24 @@ class CliTests(BrokerCase):
             self.env.pop(k, None)
 
     def pls(self, *args):
-        return subprocess.run([sys.executable, BIN, *args], env=self.env,
+        return subprocess.run([sys.executable, BIN, *args], env=self.env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=20)
+
+    def pls_on_a_terminal(self, answer, *args):
+        primary, secondary = os.openpty()
+        try:
+            p = subprocess.Popen([sys.executable, BIN, *args], env=self.env, stdin=secondary,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            os.write(primary, answer.encode())
+            out, err = p.communicate(timeout=20)
+        finally:
+            os.close(secondary)
+            os.close(primary)
+        return p.returncode, out, err
+
+    def nothing_queued(self):
+        s = get(self.url, "/status")
+        return not s["held"] and not s["waiting"]
 
     def test_run_exports_the_card_and_fills_device(self):
         p = self.pls("run", "--on", "maxq", "--", "sh", "-c", self.SHOW, "sh", "--gpus=device={device}")
@@ -443,9 +461,44 @@ class CliTests(BrokerCase):
         self.assertEqual(p.stdout.strip(), f"{MAXQ}|PCI_BUS_ID|{MAXQ}|maxq|--gpus=device={MAXQ}")
         self.assertIn("lease granted on maxq (RTX PRO 6000 Blackwell Max-Q)", p.stderr)
 
-    def test_run_without_on_uses_the_default_set(self):
+    def test_run_without_on_refuses_when_nobody_can_answer(self):
+        self.acquire("ada", tool="ftljob")
+        p = self.pls("run", "--", "echo", "ran")
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("would queue for the default card:", p.stderr)
+        self.assertIn("RTX 6000 Ada [ada]: held by u (ftljob), 0 waiting", p.stderr)
+        self.assertIn("--on any, a name (maxq, blackwell, ada) or a tag (sm_120, sm_89)", p.stderr)
+        self.assertIn("pass --on, or --yes for the default", p.stderr)
+        self.assertEqual(len(get(self.url, "/status")["held"]), 1)  # only the ftljob lease
+
+    def test_yes_takes_the_default_set_without_asking(self):
+        for flag in ("--yes", "-y"):
+            p = self.pls("run", flag, "--", "sh", "-c", 'echo "$PLS_CARD"')
+            self.assertEqual((p.returncode, p.stdout.strip()), (0, "ada"), flag)
+            self.assertNotIn("default", p.stderr)
+
+    @unittest.skipUnless(hasattr(os, "openpty"), "needs a pseudo-terminal")
+    def test_run_without_on_asks_on_a_terminal(self):
+        code, out, err = self.pls_on_a_terminal("y\n", "run", "--", "sh", "-c", 'echo "$PLS_CARD"')
+        self.assertEqual((code, out.strip()), (0, "ada"))
+        self.assertIn("Queue for the default? [y/N]", err)
+        for answer in ("n\n", "\n"):
+            code, out, err = self.pls_on_a_terminal(answer, "run", "--", "echo", "ran")
+            self.assertEqual((code, out), (1, ""), repr(answer))
+            self.assertIn("Not started.", err)
+            self.assertTrue(self.nothing_queued())
+
+    def test_on_never_asks(self):
+        p = self.pls("run", "--on", "ada", "--", "sh", "-c", 'echo "$PLS_CARD"')
+        self.assertEqual((p.returncode, p.stdout.strip()), (0, "ada"))
+        self.assertNotIn("default", p.stderr)
+
+    def test_one_card_never_asks(self):
+        app._configure(ONE)
         p = self.pls("run", "--", "sh", "-c", 'echo "$PLS_CARD"')
-        self.assertEqual(p.stdout.strip(), "ada")
+        self.assertEqual((p.returncode, p.stdout.strip()), (0, "ada"))
+        self.assertNotIn("default", p.stderr)
 
     def test_on_is_repeatable_and_comma_separated(self):
         self.acquire("maxq")

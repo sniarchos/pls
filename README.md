@@ -176,7 +176,11 @@ pls watch [--interval S]
 ```
 
 - `--on`: `any`, a card name or a tag. Repeat it or comma-separate to accept any of several
-  (`--on maxq --on ada`, `--on sm_120,sm_89`). Default: the broker's `PLS_DEFAULT`.
+  (`--on maxq --on ada`, `--on sm_120,sm_89`). Without it, on a broker with several cards,
+  `pls run` explains where the job would go (the broker's `PLS_DEFAULT`, who holds those cards,
+  how many wait) and asks before queueing. Where nobody can answer (no terminal on stdin) it
+  stops with the same explanation instead.
+- `--yes`, `-y`: take the default cards without asking.
 - `--cost`: the job's resource cost. Purely informational unless a budget
   is set; then it gates co-residency. Default `0`.
 - `--prio`: serving order is `high`, then `normal`, then `low`. Orders the **waiting** queue (priority, then
@@ -232,7 +236,7 @@ restart reload and reboot discard, and `pls run`'s exports and `{device}`.
 POST /acquire   {user, tool, cost, priority, on} -> {id, state, position, ahead, card}
 POST /heartbeat/<id>                             -> {id, state, position, ahead, card}
 POST /release/<id>                               -> {ok}
-GET  /status                                     -> {label, unit, capacity, budget, held[], waiting[], cards[]}
+GET  /status                                     -> {label, unit, capacity, budget, held[], waiting[], cards[], default[]}
 GET  /                                           -> live HTML+JS status page
 GET  /healthz                                    -> {ok}
 ```
@@ -242,5 +246,6 @@ GET  /healthz                                    -> {ok}
 - `card` is `{id, label, device}` once the ticket is held on a card, else `null`.
 - With cards, `held[]` entries gain `card` (its id), `waiting[]` entries gain `on` (what was
   asked) and `eligible` (card ids, in placement order), and `cards[]` lists every card with its
-  names, tags, label, device, capacity and budget. `capacity` is then the total over all cards.
-  Without cards, `/status` has no `cards` key and its entries keep their original fields.
+  names, tags, label, device, capacity and budget. `default` lists the card ids a ticket that names
+  no card can use (`PLS_DEFAULT`). `capacity` is then the total over all cards.
+  Without cards, `/status` has no `cards` or `default` key and its entries keep their original fields.
