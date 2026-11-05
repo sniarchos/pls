@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """pls: a command-line client for the Polite Little Semaphore lease broker.
 
-    pls run [--cost N] [--prio low|normal|high] [--tool L] [--user U] -- CMD...
+    pls run [--on CARD] [--cost N] [--prio low|normal|high] [--tool L] [--user U] -- CMD...
         acquire a lease, run CMD once it's granted, release when CMD exits (or on Ctrl-C).
+        CARD is any, a card name or a tag (repeatable or comma-separated). A granted card's
+        UUID replaces {device} in CMD and is exported as CUDA_VISIBLE_DEVICES and PLS_DEVICE.
     pls status [--json]
-        show who holds the resource and who's waiting (the terminal view).
+        show who holds each card and who's waiting (the terminal view).
     pls watch [--interval S]
         like `status`, refreshed in place.
 
 Examples
     pls run --cost 24 -- docker run --gpus all boltzgen ...
     pls run --cost 12 --prio high -- /opt/bhesm/bin/bhesm-fold in.fasta -o out.cif
+    pls run --on maxq -- docker run --gpus device={device} bindcraft2 ...
     pls status
 """
-from __future__ import annotations
-
 import argparse
 import os
 import shlex
@@ -26,7 +27,7 @@ import time
 # because realpath() resolves the link to the real bin/ dir under the install root)
 _HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "client"))
-from pls import _call, lease_sync, PLS_URL  # noqa: E402
+from pls import _call, lease_sync, PlsError, PLS_URL  # noqa: E402
 
 
 def _fmt(secs):
@@ -41,23 +42,37 @@ def _fmt(secs):
 
 
 def _print_status(s):
-    cap = s.get("capacity", 1)
     unit = s.get("unit", "")
-    budget = s.get("budget", 0)
-    extra = (f"  budget {budget}{(' ' + unit) if unit else ''}") if budget else ""
-    print(f"pls  {s.get('label', 'resource')}  ({PLS_URL})   capacity={cap}{extra}")
-    held, waiting = s.get("held", []), s.get("waiting", [])
-    if held:
-        for h in held:
-            cost = (f"  ~{h['cost']}{(' ' + unit) if unit else ''}") if h.get("cost") else ""
-            print(f"  IN USE   {h['user']:<12} {h['tool']:<38} {_fmt(h['held_s'])}{cost}")
+    u = (" " + unit) if unit else ""
+    held, waiting, cards = s.get("held", []), s.get("waiting", []), s.get("cards")
+    if cards:
+        print(f"pls  {s.get('label', 'resource')}  ({PLS_URL})")
+        for c in cards:
+            tags = f" tags={','.join(c['tags'])}" if c["tags"] else ""
+            budget = f"  budget {c['budget']}{u}" if c.get("budget") else ""
+            print(f"  {c['label']}  names={','.join(c['names'])}{tags}  capacity={c['capacity']}{budget}")
+            _print_held([h for h in held if h.get("card") == c["id"]], u, "    ")
     else:
-        print("  IN USE   (free)")
+        budget = s.get("budget", 0)
+        extra = f"  budget {budget}{u}" if budget else ""
+        print(f"pls  {s.get('label', 'resource')}  ({PLS_URL})   capacity={s.get('capacity', 1)}{extra}")
+        _print_held(held, u, "  ")
     if waiting:
         for i, w in enumerate(waiting, 1):
-            print(f"  WAIT #{i:<2} {w['user']:<12} {w['tool']:<38} {w['priority']:<12} ({_fmt(w['waited_s'])})")
+            line = f"  WAIT #{i:<2} {w['user']:<12} {w['tool']:<38} {w['priority']:<12} ({_fmt(w['waited_s'])})"
+            if cards:
+                line += f"  for {', '.join(w.get('eligible', []))}"
+            print(line)
     else:
         print("  WAIT     (nobody)")
+
+
+def _print_held(held, u, pad):
+    if not held:
+        print(f"{pad}IN USE   (free)")
+    for h in held:
+        cost = f"  ~{h['cost']}{u}" if h.get("cost") else ""
+        print(f"{pad}IN USE   {h['user']:<12} {h['tool']:<38} {_fmt(h['held_s'])}{cost}")
 
 
 def cmd_status(args):
@@ -104,14 +119,40 @@ def cmd_run(args, cmd):
             sys.stderr.write(f"\r[pls] queued - position {pos} ...        ")
             sys.stderr.flush()
 
-    with lease_sync(tool=tool, cost=args.cost, priority=args.prio,
-                    user=args.user, on_wait=on_wait) as tid:
-        if last["pos"] is not None:
-            sys.stderr.write("\r[pls] lease granted - running.            \n")
-            sys.stderr.flush()
-        elif tid is None:
-            sys.stderr.write("[pls] running WITHOUT a lease (broker down)\n")
-        return subprocess.call(cmd)
+    try:
+        with lease_sync(tool=tool, cost=args.cost, priority=args.prio, user=args.user,
+                        on_wait=on_wait, on=args.on) as grant:
+            return _launch(cmd, grant, waited=last["pos"] is not None)
+    except PlsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _launch(cmd, grant, waited):
+    if grant is None:
+        msg = "running WITHOUT a lease (broker down)"
+    elif grant.card:
+        about = f" ({grant.label})" if grant.label != grant.card else ""
+        msg = f"lease granted on {grant.card}{about} - running."
+    else:
+        msg = "lease granted - running." if waited else ""
+    if msg:
+        lead = "\r" if waited else ""
+        sys.stderr.write(f"{lead}[pls] {msg}            \n")
+        sys.stderr.flush()
+
+    device = grant.device if grant else None
+    if any("{device}" in c for c in cmd):
+        if not device:
+            print("error: the command uses {device} but no card was granted", file=sys.stderr)
+            return 2
+        cmd = [c.replace("{device}", device) for c in cmd]
+    env = None
+    if grant and grant.card:
+        env = dict(os.environ, PLS_CARD=grant.card)
+        if device:
+            env.update(CUDA_VISIBLE_DEVICES=device, CUDA_DEVICE_ORDER="PCI_BUS_ID", PLS_DEVICE=device)
+    return subprocess.call(cmd, env=env)
 
 
 def main():
@@ -125,6 +166,9 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pr = sub.add_parser("run", help="acquire a lease, run CMD (after --), release")
+    pr.add_argument("--on", action="append", default=None, metavar="CARD",
+                    help="any, a card name or a tag; repeatable or comma-separated "
+                         "(default: the broker's PLS_DEFAULT)")
     pr.add_argument("--cost", type=float, default=0.0, dest="cost",
                     help="estimated resource cost (e.g. GPU VRAM in GB)")
     pr.add_argument("--prio", default="normal",
@@ -132,10 +176,10 @@ def main():
     pr.add_argument("--tool", default=None, help="label shown in the queue (default: the command)")
     pr.add_argument("--user", default=None, help="override the user shown (default $USER)")
 
-    ps = sub.add_parser("status", help="show holder + queue (one shot)")
+    ps = sub.add_parser("status", help="show holders + queue (one shot)")
     ps.add_argument("--json", action="store_true")
 
-    pw = sub.add_parser("watch", help="show holder + queue, refreshed in place")
+    pw = sub.add_parser("watch", help="show holders + queue, refreshed in place")
     pw.add_argument("--interval", type=float, default=2.0)
 
     args = p.parse_args(argv)

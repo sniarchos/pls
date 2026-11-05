@@ -1,38 +1,22 @@
 #!/usr/bin/env python3
-"""pls: a Polite Little Semaphore (a tiny single-resource lease broker).
+"""pls: a Polite Little Semaphore, a tiny lease broker for shared resources.
 
-A dependency-free HTTP service that arbitrates access to ONE shared, fungible resource (a
-GPU, a slab of RAM, a pool of license seats, anything). Clients ask here *before* using the
-resource and release when done; the broker just keeps a list of tickets in memory and decides
-who goes next. It never touches the resource itself.
+Clients ask here before using a resource and release when done; the broker only keeps tickets
+and decides who goes next. With no ``PLS_CARD_<n>_*`` settings it guards one resource sized by
+``PLS_CAPACITY`` and ``PLS_BUDGET``. With them it guards any number of cards, which tickets pick
+by name, by tag or with ``any``. See the README.
 
-The resource is generic. "cost" is whatever additive quantity a job consumes (GPU VRAM in GB,
-RAM, seats, credits...); set ``PLS_BUDGET`` to cap the running total, or leave it 0 to gate purely
-on ``PLS_CAPACITY`` (a plain N-slot lock). GPU sharing is the flagship use case (see the README).
-
-Design notes
-------------
-* **Stdlib only, Python >= 3.7.** No venv, no pip. It's the always-on arbiter, so it has the
-  fewest possible moving parts.
-* **Ticket + poll, never a long-held connection.** ``/acquire`` answers instantly ("you are #2");
-  clients poll ``/heartbeat`` in a local loop until granted. Nothing the broker holds open, so
-  no proxy/gateway timeout can ever fire on it.
-* **Heartbeat + TTL.** A holder or waiter that goes silent for ``PLS_HEARTBEAT_TTL`` seconds is
-  reaped, so a crashed job can never wedge the queue.
-
-Endpoints
----------
-  POST /acquire            {user, tool, cost, priority} -> {id, state, position}
-  POST /heartbeat/<id>                                  -> {id, state, position}
+  POST /acquire        {user, tool, cost, priority, on} -> {id, state, position, ahead, card}
+  POST /heartbeat/<id>                                  -> {id, state, position, ahead, card}
   POST /release/<id>                                    -> {ok}
-  GET  /status                                          -> {label, unit, capacity, budget, held, waiting}
+  GET  /status                    -> {label, unit, capacity, budget, held, waiting[, cards]}
   GET  /                                                -> live HTML+JS status page
   GET  /healthz                                         -> {ok}
 """
-from __future__ import annotations
-
 import json
 import os
+import re
+import sys
 import threading
 import time
 import uuid
@@ -64,23 +48,129 @@ def _load_env_file():
 
 _load_env_file()
 
-# ---- config (all env-overridable; see .env / .env.example) ------------------
 HOST = os.getenv("PLS_HOST", "0.0.0.0")
 PORT = int(os.getenv("PLS_PORT", "5555"))
-CAPACITY = int(os.getenv("PLS_CAPACITY", "1"))               # max concurrent holders
-BUDGET = float(os.getenv("PLS_BUDGET", "0"))                 # 0 = ignore cost, gate on CAPACITY only
-HEARTBEAT_TTL = float(os.getenv("PLS_HEARTBEAT_TTL", "30"))  # silence -> reaped
-DONE_RETAIN = float(os.getenv("PLS_DONE_RETAIN", "600"))     # keep finished tickets this long
-_NS = 1_000_000_000
-_HEARTBEAT_TTL_NS = int(HEARTBEAT_TTL * _NS)
-_DONE_RETAIN_NS = int(DONE_RETAIN * _NS)
-LABEL = os.getenv("PLS_LABEL", "shared resource")            # headline shown on the status page
-UNIT = os.getenv("PLS_UNIT", "")                             # cost unit suffix, e.g. "GB"
+CAPACITY = int(os.getenv("PLS_CAPACITY", "1"))
+BUDGET = float(os.getenv("PLS_BUDGET", "0"))                 # 0 = ignore cost, gate on capacity only
+HEARTBEAT_TTL = float(os.getenv("PLS_HEARTBEAT_TTL", "30"))
+DONE_RETAIN = float(os.getenv("PLS_DONE_RETAIN", "600"))
+LABEL = os.getenv("PLS_LABEL", "shared resource")
+UNIT = os.getenv("PLS_UNIT", "")
 PRIORITIES = {"high": 0, "normal": 10, "low": 20}            # lower = served first
+_NS = 1_000_000_000
+_LIVE = ("waiting", "held")
+_CARD_KEY = re.compile(r"PLS_CARD_(\d+)_(NAMES|DEVICE|LABEL|TAGS|CAPACITY|BUDGET)$")
 
-# ---- in-memory state --------------------------------------------------------
+
+def _boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+BOOT_ID = _boot_id()
+
 _lock = threading.RLock()
 _tickets = {}  # id -> ticket dict
+_saved = None  # (path, body) last written by _save
+
+
+def _split(value):
+    return [x.strip() for x in (value or "").split(",") if x.strip()]
+
+
+def _configure(env):
+    """Load the cards, the default set and the state file from ``env``. Raises ValueError on a
+    config that would let a selector mean two things."""
+    global CARDS, DEFAULT, STATE_FILE, _SELECTORS
+    raw = {}
+    for key, val in env.items():
+        if key.startswith("PLS_CARD_"):
+            m = _CARD_KEY.match(key)
+            if not m:
+                raise ValueError(f"unknown setting {key}")
+            raw.setdefault(int(m.group(1)), {})[m.group(2)] = val.strip()
+    cards = []
+    for n in sorted(raw):
+        r = raw[n]
+        names = _split(r.get("NAMES"))
+        if not names:
+            raise ValueError(f"PLS_CARD_{n}_NAMES is missing")
+        try:
+            capacity = int(r["CAPACITY"]) if r.get("CAPACITY") else None
+            budget = float(r["BUDGET"]) if r.get("BUDGET") else None
+        except ValueError:
+            raise ValueError(f"PLS_CARD_{n}_CAPACITY and PLS_CARD_{n}_BUDGET must be numbers") from None
+        cards.append({"id": names[0], "names": names, "tags": _split(r.get("TAGS")),
+                      "label": r.get("LABEL") or names[0], "device": r.get("DEVICE") or None,
+                      "capacity": capacity, "budget": budget})
+
+    names, tags = {}, {}
+    for c in cards:
+        for name in c["names"] + ([c["device"]] if c["device"] else []):
+            owner = names.setdefault(name.lower(), c["id"])
+            if owner != c["id"]:
+                raise ValueError(f"cards {owner} and {c['id']} share the name {name!r}")
+        for tag in c["tags"]:
+            ids = tags.setdefault(tag.lower(), [])
+            if c["id"] not in ids:
+                ids.append(c["id"])
+    if "any" in names or "any" in tags:
+        raise ValueError("'any' is reserved; it cannot name or tag a card")
+    clash = sorted(set(names) & set(tags))
+    if clash:
+        raise ValueError(f"{clash[0]!r} names card {names[clash[0]]} and is also a tag")
+
+    # Without cards, one implicit card stands for the whole resource; capacity/budget None mean
+    # "use PLS_CAPACITY / PLS_BUDGET", read at scheduling time.
+    CARDS = cards or [{"id": None, "names": [], "tags": [], "label": None, "device": None,
+                       "capacity": None, "budget": None}]
+    _SELECTORS = {k: [v] for k, v in names.items()}
+    _SELECTORS.update(tags)
+    _SELECTORS["any"] = [c["id"] for c in CARDS]
+    DEFAULT = _SELECTORS["any"]
+    try:
+        DEFAULT = _eligible(_tokens(env.get("PLS_DEFAULT")))
+    except ValueError as exc:
+        raise ValueError(f"PLS_DEFAULT: {exc}") from None
+
+    path = env.get("PLS_STATE_FILE")
+    if not path and env.get("STATE_DIRECTORY"):
+        path = os.path.join(env["STATE_DIRECTORY"].split(":")[0], "tickets.json")
+    STATE_FILE = path or None
+
+
+def _has_cards():
+    return CARDS[0]["id"] is not None
+
+
+def _tokens(on):
+    """Normalise a ticket's ``on`` (a string or a list, either comma-separated) to selectors."""
+    if on is None:
+        return []
+    if isinstance(on, str):
+        on = [on]
+    if not isinstance(on, list):
+        raise ValueError("'on' must be a string or a list of strings")
+    return [s.strip().lower() for item in on for s in str(item).split(",") if s.strip()]
+
+
+def _eligible(tokens):
+    """Ids of the cards the selectors pick, in config order; no selectors means the default set."""
+    if not tokens:
+        return list(DEFAULT)
+    picked = set()
+    for s in tokens:
+        if s not in _SELECTORS:
+            known = dict.fromkeys(["any"] + [w.lower() for c in CARDS for w in c["names"] + c["tags"]])
+            raise ValueError(f"unknown card or tag {s!r} (known: {', '.join(known)})")
+        picked.update(_SELECTORS[s])
+    return [c["id"] for c in CARDS if c["id"] in picked]
+
+
+_configure({})
 
 
 def _now():
@@ -98,37 +188,41 @@ def _waiting():
     )
 
 
-def _can_admit(t):
-    held = _held()
-    if len(held) >= CAPACITY:
+def _limits(card):
+    return (CAPACITY if card["capacity"] is None else card["capacity"],
+            BUDGET if card["budget"] is None else card["budget"])
+
+
+def _fits(card, t, held):
+    on_card = [x for x in held if x["card"] == card["id"]]
+    capacity, budget = _limits(card)
+    if len(on_card) >= capacity:
         return False
-    if BUDGET > 0:
-        used = sum(x["cost"] for x in held)
-        if used + t["cost"] > BUDGET:
-            return False
-    return True
+    return budget <= 0 or sum(x["cost"] for x in on_card) + t["cost"] <= budget
 
 
 def _schedule():
-    """Grant waiting tickets in priority/FIFO order while there's room. Held tickets are never
-    preempted (priority only decides who goes *next*)."""
+    """Give each waiting ticket, in priority/FIFO order, the first eligible card with room, then
+    persist. Held tickets are never preempted."""
+    held = _held()
     for t in _waiting():
-        if _can_admit(t):
-            t["state"] = "held"
-            t["granted_at"] = _now()
-            t["last_seen"] = _now()
+        for card in CARDS:
+            if card["id"] in t["eligible"] and _fits(card, t, held):
+                now = _now()
+                t.update(state="held", card=card["id"], granted_at=now, last_seen=now)
+                held.append(t)
+                break
+    _save()
 
 
 def _reap():
     now = _now()
     for t in list(_tickets.values()):
-        if t["state"] in ("waiting", "held") and now - t["last_seen"] > _HEARTBEAT_TTL_NS:
-            t["state"] = "done"
-            t["reaped"] = True
-            t["ended_at"] = now
+        if t["state"] in _LIVE and now - t["last_seen"] > HEARTBEAT_TTL * _NS:
+            t.update(state="done", reaped=True, ended_at=now)
     _schedule()
     for tid in [tid for tid, t in _tickets.items()
-                if t["state"] == "done" and now - t.get("ended_at", now) > _DONE_RETAIN_NS]:
+                if t["state"] == "done" and now - t.get("ended_at", now) > DONE_RETAIN * _NS]:
         del _tickets[tid]
 
 
@@ -139,33 +233,90 @@ def _reaper_loop():
             _reap()
 
 
+def _save():
+    global _saved
+    if not STATE_FILE:
+        return
+    live = [{k: v for k, v in t.items() if k != "last_seen"}
+            for t in _tickets.values() if t["state"] in _LIVE]
+    body = json.dumps({"boot_id": BOOT_ID, "tickets": live})
+    if _saved == (STATE_FILE, body):
+        return
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.replace(tmp, STATE_FILE)
+        _saved = (STATE_FILE, body)
+    except OSError as exc:
+        print(f"pls: cannot save tickets to {STATE_FILE}: {exc}", file=sys.stderr, flush=True)
+
+
+def _load():
+    """Reload the live tickets a previous run saved, each with a fresh TTL. Their timestamps are
+    CLOCK_MONOTONIC readings, which only stay meaningful until the next reboot."""
+    if not STATE_FILE:
+        return
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        print(f"pls: ignoring unreadable {STATE_FILE}: {exc}", file=sys.stderr, flush=True)
+        return
+    if saved.get("boot_id") != BOOT_ID:
+        print("pls: discarding tickets saved before the last reboot", flush=True)
+        return
+    now, ids, kept = _now(), [c["id"] for c in CARDS], 0
+    for t in saved.get("tickets") or []:
+        try:
+            t["eligible"] = _eligible(t["on"])
+            if t["state"] == "held" and t["card"] not in ids:
+                raise ValueError(f"card {t['card']} is no longer configured")
+        except (KeyError, TypeError, ValueError) as exc:
+            print(f"pls: dropping saved ticket {t.get('id')}: {exc}", file=sys.stderr, flush=True)
+            continue
+        t["last_seen"] = now
+        _tickets[t["id"]] = t
+        kept += 1
+    print(f"pls: reloaded {kept} ticket(s) from {STATE_FILE}", flush=True)
+    _schedule()
+
+
 def _state_of(t):
     pos = _waiting().index(t) + 1 if t["state"] == "waiting" else None
+    card = None
+    if t["state"] == "held" and t["card"] is not None:
+        c = next(c for c in CARDS if c["id"] == t["card"])
+        card = {"id": c["id"], "label": c["label"], "device": c["device"]}
     return {"id": t["id"], "state": t["state"], "position": pos,
-            "ahead": (pos - 1) if pos else 0}
+            "ahead": (pos - 1) if pos else 0, "card": card}
 
 
 def _status_payload():
     now = _now()
-    return {
-        "label": LABEL,
-        "unit": UNIT,
-        "capacity": CAPACITY,
-        "budget": BUDGET,
-        "held": [
-            {"id": t["id"], "user": t["user"], "tool": t["tool"], "cost": t["cost"],
+    cards = _has_cards()
+    held, waiting = [], []
+    for t in _held():
+        h = {"id": t["id"], "user": t["user"], "tool": t["tool"], "cost": t["cost"],
              "held_s": (now - t["granted_at"]) // _NS if t.get("granted_at") else 0}
-            for t in _held()
-        ],
-        "waiting": [
-            {"id": t["id"], "user": t["user"], "tool": t["tool"],
+        if cards:
+            h["card"] = t["card"]
+        held.append(h)
+    for t in _waiting():
+        w = {"id": t["id"], "user": t["user"], "tool": t["tool"],
              "priority": t["priority_name"], "waited_s": (now - t["created_at"]) // _NS}
-            for t in _waiting()
-        ],
-    }
+        if cards:
+            w.update(on=t["on"], eligible=t["eligible"])
+        waiting.append(w)
+    status = {"label": LABEL, "unit": UNIT, "capacity": sum(_limits(c)[0] for c in CARDS),
+              "budget": BUDGET, "held": held, "waiting": waiting}
+    if cards:
+        status["cards"] = [dict(c, capacity=_limits(c)[0], budget=_limits(c)[1]) for c in CARDS]
+    return status
 
 
-# ---- HTTP -------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     server_version = "pls/1.0"
     protocol_version = "HTTP/1.1"
@@ -208,18 +359,29 @@ class Handler(BaseHTTPRequestHandler):
             prio_name = str(body.get("priority") or "normal")
             if prio_name not in PRIORITIES:
                 prio_name = "normal"
+            try:
+                on = _tokens(body.get("on"))
+                eligible = _eligible(on)
+                cost = float(body.get("cost") or 0.0)
+            except (TypeError, ValueError) as exc:
+                self._send(400, {"error": str(exc)})
+                return
             with _lock:
+                now = _now()
                 t = {
                     "id": uuid.uuid4().hex[:12],
                     "user": str(body.get("user") or "unknown")[:40],
                     "tool": str(body.get("tool") or "?")[:1000],
-                    "cost": float(body.get("cost") or 0.0),
-                    "priority": PRIORITIES.get(prio_name, 10),
+                    "cost": cost,
+                    "priority": PRIORITIES[prio_name],
                     "priority_name": prio_name,
+                    "on": on,
+                    "eligible": eligible,
+                    "card": None,
                     "state": "waiting",
-                    "created_at": _now(),
+                    "created_at": now,
                     "granted_at": None,
-                    "last_seen": _now(),
+                    "last_seen": now,
                 }
                 _tickets[t["id"]] = t
                 _schedule()
@@ -227,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
         elif len(parts) == 2 and parts[0] == "heartbeat":
             with _lock:
                 t = _tickets.get(parts[1])
-                if t and t["state"] in ("waiting", "held"):
+                if t and t["state"] in _LIVE:
                     t["last_seen"] = _now()
                     _schedule()
                     self._send(200, _state_of(t))
@@ -237,17 +399,15 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 t = _tickets.get(parts[1])
                 if t:
-                    t["state"] = "done"
-                    t["ended_at"] = _now()
-                    t["last_seen"] = _now()
+                    t.update(state="done", ended_at=_now(), last_seen=_now())
                     _schedule()
                 self._send(200, {"ok": True})
         else:
             self._send(404, {"error": "not found"})
 
 
-# Dependency-free status page: plain HTML + vanilla JS that polls /status every 2s and
-# re-renders in place (no reloads, no frameworks, no external fonts/CDNs). Light/dark adaptive.
+# Plain HTML + vanilla JS that polls /status every 2s and re-renders in place (no frameworks,
+# no external fonts/CDNs). Light/dark adaptive.
 _PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -293,9 +453,19 @@ _PAGE = """<!doctype html>
   .ts{color:var(--faint); font-size:.82rem; font-variant-numeric:tabular-nums;}
   h2{font-size:.72rem; text-transform:uppercase; letter-spacing:.07em; color:var(--faint);
      margin:1.7rem 0 .6rem; font-weight:600;}
+  #panels{display:grid; gap:.8rem;}
   .card{background:var(--panel); border:1px solid var(--border); border-radius:12px;
         box-shadow:var(--shadow); overflow:hidden;}
+  .head{display:flex; align-items:center; flex-wrap:wrap; gap:.45rem; padding:.65rem .9rem;
+        background:var(--head); border-bottom:1px solid var(--border);}
+  .head .name{font-weight:650; margin-right:.3rem;}
+  .chip{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.76rem;
+        border:1px solid var(--border); border-radius:6px; padding:0 .4rem; color:var(--muted);
+        background:var(--panel);}
+  .chip.tag{border-style:dashed;}
+  .head .use{margin-left:auto; color:var(--muted); font-size:.82rem; font-variant-numeric:tabular-nums;}
   table{width:100%; border-collapse:collapse;}
+  table.held{table-layout:fixed;}
   th{font-size:.7rem; text-transform:uppercase; letter-spacing:.04em; color:var(--faint);
      text-align:left; font-weight:600; padding:.55rem .9rem; background:var(--head);
      border-bottom:1px solid var(--border);}
@@ -326,8 +496,8 @@ _PAGE = """<!doctype html>
   </header>
   <div class="sub" id="sub"></div>
 
-  <h2>In use</h2>
-  <div class="card" id="held-card"></div>
+  <h2 id="panels-title">In use</h2>
+  <div id="panels"></div>
 
   <h2>Queue</h2>
   <div class="card" id="wait-card"></div>
@@ -352,9 +522,22 @@ const tdTool = name => {
   td.append(el("span", "tool", name));
   return td;
 };
+const withUnit = (n, unit) => n + (unit ? " " + unit : "");
+
+function cardHead(c, held, unit) {
+  const h = el("div", "head");
+  const name = el("span", "name", c.label);
+  if (c.device) name.title = c.device;
+  h.append(name);
+  for (const n of c.names) h.append(el("span", "chip", n));
+  for (const t of c.tags) h.append(el("span", "chip tag", t));
+  let use = held.length + " / " + c.capacity;
+  if (c.budget > 0) use += ", " + held.reduce((a, x) => a + x.cost, 0) + " of " + withUnit(c.budget, unit);
+  h.append(el("span", "use", use));
+  return h;
+}
 
 function renderHeld(card, held, unit) {
-  card.replaceChildren();
   if (!held.length) {
     const d = el("div", "free");
     d.append(el("span", "dot"), el("span", null, "free"));
@@ -362,28 +545,50 @@ function renderHeld(card, held, unit) {
     return;
   }
   const t = el("table");
-  t.innerHTML = "<thead><tr><th>User</th><th>Tool</th><th>Held for</th><th>Cost</th></tr></thead>";
+  t.className = "held";
+  t.innerHTML = "<colgroup><col style='width:14%'><col><col style='width:12%'><col style='width:12%'></colgroup>" +
+                "<thead><tr><th>User</th><th>Tool</th><th>Held for</th><th>Cost</th></tr></thead>";
   const tb = el("tbody");
   for (const h of held) {
     const tr = el("tr");
     tr.append(el("td", "u", h.user), tdTool(h.tool), el("td", "num", fmt(h.held_s)),
-              el("td", "num", h.cost ? (h.cost + (unit ? " " + unit : "")) : "—"));
+              el("td", "num", h.cost ? withUnit(h.cost, unit) : "—"));
     tb.append(tr);
   }
   t.append(tb); card.append(t);
 }
 
-function renderWait(card, waiting) {
+function renderPanels(root, s) {
+  root.replaceChildren();
+  const groups = s.cards
+    ? s.cards.map(c => ({ card: c, held: s.held.filter(h => h.card === c.id) }))
+    : [{ card: null, held: s.held }];
+  for (const g of groups) {
+    const box = el("div", "card");
+    if (g.card) box.append(cardHead(g.card, g.held, s.unit));
+    renderHeld(box, g.held, s.unit);
+    root.append(box);
+  }
+}
+
+function renderWait(card, waiting, cards) {
   card.replaceChildren();
   if (!waiting.length) { card.append(el("div", "empty", "nobody waiting")); return; }
   const t = el("table");
-  t.innerHTML = "<thead><tr><th>#</th><th>User</th><th>Tool</th><th>Priority</th><th>Waited</th></tr></thead>";
+  t.innerHTML = "<thead><tr><th>#</th><th>User</th><th>Tool</th>" + (cards ? "<th>Cards</th>" : "") +
+                "<th>Priority</th><th>Waited</th></tr></thead>";
   const tb = el("tbody");
   waiting.forEach((w, i) => {
     const tr = el("tr");
     const tdPos = el("td"); tdPos.append(el("span", "pos", String(i + 1)));
     const tdPri = el("td"); tdPri.append(el("span", "pill " + w.priority, w.priority));
-    tr.append(tdPos, el("td", "u", w.user), tdTool(w.tool), tdPri, el("td", "num", fmt(w.waited_s)));
+    tr.append(tdPos, el("td", "u", w.user), tdTool(w.tool));
+    if (cards) {
+      const tdCards = el("td");
+      for (const id of w.eligible) tdCards.append(el("span", "chip", id), " ");
+      tr.append(tdCards);
+    }
+    tr.append(tdPri, el("td", "num", fmt(w.waited_s)));
     tb.append(tr);
   });
   t.append(tb); card.append(t);
@@ -394,12 +599,17 @@ async function tick() {
   try {
     const s = await (await fetch("/status", { cache: "no-store" })).json();
     dot.classList.remove("stale");
-    let sub = '<span class="badge">' + (s.label || "resource") + '</span>' +
-              ' <span class="badge">capacity ' + s.capacity + '</span>';
-    if (s.budget > 0) sub += ' <span class="badge">budget ' + s.budget + (s.unit ? ' ' + s.unit : '') + '</span>';
-    document.getElementById("sub").innerHTML = sub;
-    renderHeld(document.getElementById("held-card"), s.held, s.unit);
-    renderWait(document.getElementById("wait-card"), s.waiting);
+    const sub = document.getElementById("sub");
+    sub.replaceChildren(el("span", "badge", s.label || "resource"), " ");
+    if (s.cards) {
+      sub.append(el("span", "badge", s.cards.length + (s.cards.length === 1 ? " card" : " cards")));
+    } else {
+      sub.append(el("span", "badge", "capacity " + s.capacity));
+      if (s.budget > 0) sub.append(" ", el("span", "badge", "budget " + withUnit(s.budget, s.unit)));
+    }
+    document.getElementById("panels-title").textContent = s.cards ? "Cards" : "In use";
+    renderPanels(document.getElementById("panels"), s);
+    renderWait(document.getElementById("wait-card"), s.waiting, !!s.cards);
     document.getElementById("ts").textContent = new Date().toLocaleTimeString();
   } catch (e) {
     dot.classList.add("stale");
@@ -414,12 +624,20 @@ setInterval(tick, 2000);
 
 
 def main():
+    try:
+        _configure(os.environ)
+    except ValueError as exc:
+        sys.exit(f"pls: refusing to start: {exc}")
+    with _lock:
+        _load()
     threading.Thread(target=_reaper_loop, daemon=True).start()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(
-        f"pls listening on {HOST}:{PORT} (capacity={CAPACITY}, budget={BUDGET}, ttl={HEARTBEAT_TTL}s, label={LABEL!r})",
-        flush=True,
-    )
+    if _has_cards():
+        what = f"cards={','.join(c['id'] for c in CARDS)}, default={','.join(DEFAULT)}"
+    else:
+        what = f"capacity={CAPACITY}, budget={BUDGET}"
+    print(f"pls listening on {HOST}:{PORT} ({what}, ttl={HEARTBEAT_TTL}s, label={LABEL!r}, "
+          f"state={STATE_FILE})", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

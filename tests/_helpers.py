@@ -22,11 +22,12 @@ def start_broker(app, capacity=1, budget=0.0, ttl=30.0):
     The caller must httpd.shutdown()/server_close() in tearDown.
     """
     app._tickets.clear()
+    app._configure({})
     app.CAPACITY = capacity
     app.BUDGET = budget
     app.HEARTBEAT_TTL = ttl
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
 
 

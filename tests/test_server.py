@@ -21,6 +21,7 @@ def _add(state="waiting", priority="normal", created_at=None, cost=0.0,
     t = {
         "id": uuid.uuid4().hex[:12], "user": "u", "tool": "t", "cost": cost,
         "priority": app.PRIORITIES[priority], "priority_name": priority, "state": state,
+        "on": [], "eligible": [None], "card": None,
         "created_at": created_at if created_at is not None else now,
         "granted_at": granted_at,
         "last_seen": last_seen if last_seen is not None else now,
