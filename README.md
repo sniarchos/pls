@@ -195,8 +195,12 @@ When a card is granted, `pls run` says which one and hands it to the command:
 - The command's environment gains `CUDA_VISIBLE_DEVICES=<UUID>`, `CUDA_DEVICE_ORDER=PCI_BUS_ID`,
   `PLS_DEVICE=<UUID>` and `PLS_CARD=<name>`, so host processes see only their card.
 
-`pls status` and `pls watch` show each card with its holders, then the queue with the cards
-each ticket can use. Without cards the output is the single-resource view.
+`pls status` and `pls watch` show each card, marked ● when held and ○ when free, with its holders
+and their full job names, then the queue with the cards each ticket can use. Where `nvidia-smi`
+is installed, each card's line also shows its memory in use and its load, which also reveals GPU
+work running without a lease. In a terminal the view is coloured (`NO_COLOR` turns that off);
+piped, it is plain text. `pls watch` redraws in place with the time on the title line. Without
+cards the view shows the one resource.
 
 ## Embedding in your app
 

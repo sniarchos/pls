@@ -524,25 +524,48 @@ class CliTests(BrokerCase):
     def test_status_shows_each_card(self):
         self.acquire("maxq", tool="bigjob", cost=60)
         self.acquire("sm_120", tool="nextjob")
+        self.env["PATH"] = ""  # no nvidia-smi, so no live usage to vary the output
         out = self.pls("status").stdout.splitlines()
-        self.assertEqual(out[1], "  RTX PRO 6000 Blackwell Max-Q  names=maxq,blackwell tags=sm_120  capacity=1")
-        self.assertTrue(out[2].startswith("    IN USE   u            bigjob"), out[2])
-        self.assertEqual(out[3:5], ["  RTX 6000 Ada  names=ada tags=sm_89  capacity=1", "    IN USE   (free)"])
-        self.assertTrue(out[5].startswith("  WAIT #1  u            nextjob"), out[5])
-        self.assertTrue(out[5].endswith("  for maxq"), out[5])
+        self.assertTrue(out[0].startswith("pls · "), out[0])
+        self.assertEqual(out[2], "● RTX PRO 6000 Blackwell Max-Q   maxq, blackwell · sm_120")
+        self.assertTrue(out[3].startswith("    u            bigjob  "), out[3])
+        self.assertTrue(out[3].endswith("  ~60 GB"), out[3])
+        self.assertEqual(out[4:8], ["○ RTX 6000 Ada   ada · sm_89 · default", "    free", "", "queue"])
+        self.assertTrue(out[8].startswith("   1  u            nextjob  normal"), out[8])
+        self.assertTrue(out[8].endswith("  for maxq"), out[8])
 
-    def test_status_without_cards_is_unchanged(self):
+    def test_status_shows_full_job_names_and_lines_up_live_usage(self):
+        cli = _load_cli()
+        name = "bench maxq full-fused-fp32-msa complex rep1 seed0 with a long tail"
+        status = {"label": "GPUs", "unit": "GB", "default": ["ada"], "waiting": [],
+                  "held": [{"id": "1", "user": "alice", "tool": name, "cost": 0, "held_s": 5, "card": "maxq"}],
+                  "cards": [{"id": "maxq", "label": "Max-Q", "names": ["maxq"], "tags": ["sm_120"],
+                             "capacity": 1, "budget": 0, "device": MAXQ},
+                            {"id": "ada", "label": "Ada", "names": ["ada"], "tags": [],
+                             "capacity": 1, "budget": 0, "device": ADA}]}
+        out = cli._render_status(status, usage={MAXQ: "6.4/96 GB   46%", ADA: "0.5/48 GB    0%"})
+        self.assertEqual(out[2], "● Max-Q   maxq · sm_120   6.4/96 GB   46%")
+        self.assertEqual(out[3], f"    alice        {name}      5s")
+        self.assertEqual(out[4], "○ Ada   ada · default     0.5/48 GB    0%")
+
+    def test_status_without_cards_shows_the_one_resource(self):
         cli = _load_cli()
         status = {"label": "GPU 0", "unit": "GB", "capacity": 1, "budget": 0.0,
                   "held": [{"id": "1", "user": "alice", "tool": "jobA", "cost": 20.0, "held_s": 75}],
                   "waiting": [{"id": "2", "user": "bob", "tool": "jobB", "priority": "high", "waited_s": 3}]}
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            cli._print_status(status)
-        self.assertEqual(buf.getvalue().splitlines()[1:], [
-            "  IN USE   alice        jobA                                   1m15s  ~20.0 GB",
-            "  WAIT #1  bob          jobB                                   high         (3s)",
+        self.assertEqual(cli._render_status(status)[2:], [
+            "● GPU 0",
+            "    alice        jobA   1m15s  ~20 GB",
+            "",
+            "queue",
+            "   1  bob          jobB  high        3s",
         ])
+
+    def test_status_is_coloured_only_when_asked(self):
+        cli = _load_cli()
+        status = {"label": "GPU 0", "capacity": 1, "held": [], "waiting": []}
+        self.assertNotIn("\x1b[", "\n".join(cli._render_status(status)))
+        self.assertIn("\x1b[32m", "\n".join(cli._render_status(status, color=True)))
 
 
 if __name__ == "__main__":

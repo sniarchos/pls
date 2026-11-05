@@ -19,7 +19,9 @@ Examples
 """
 import argparse
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -42,38 +44,103 @@ def _fmt(secs):
     return f"{h}h{m:02d}m"
 
 
-def _print_status(s):
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _painter(color):
+    def paint(text, code):
+        return f"\x1b[{code}m{text}\x1b[0m" if color else text
+    return paint
+
+
+def _wants_color():
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def _visible(text):
+    return len(_ANSI.sub("", text))
+
+
+def _usage(cards):
+    """Each card's memory and load by UUID, from nvidia-smi where it is installed."""
+    if not any(str(c.get("device") or "").startswith("GPU-") for c in cards):
+        return {}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=uuid,memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2, check=True,
+        ).stdout
+        usage = {}
+        for line in out.splitlines():
+            uuid, used, total, load = (part.strip() for part in line.split(","))
+            usage[uuid] = f"{float(used) / 1024:.1f}/{float(total) / 1024:.0f} GB  {int(load):>3}%"
+        return usage
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+
+
+def _render_status(s, color=False, usage=None):
+    """The status view as lines."""
+    paint = _painter(color)
     unit = s.get("unit", "")
-    u = (" " + unit) if unit else ""
     held, waiting, cards = s.get("held", []), s.get("waiting", []), s.get("cards")
     if cards:
-        print(f"pls  {s.get('label', 'resource')}  ({PLS_URL})")
-        for c in cards:
-            tags = f" tags={','.join(c['tags'])}" if c["tags"] else ""
-            budget = f"  budget {c['budget']}{u}" if c.get("budget") else ""
-            print(f"  {c['label']}  names={','.join(c['names'])}{tags}  capacity={c['capacity']}{budget}")
-            _print_held([h for h in held if h.get("card") == c["id"]], u, "    ")
+        title = f"pls · {s.get('label', 'resource')}"
+        default = set(s.get("default") or []) if len(cards) > 1 else set()
+        groups = [(c, [h for h in held if h.get("card") == c["id"]], c["id"] in default) for c in cards]
     else:
-        budget = s.get("budget", 0)
-        extra = f"  budget {budget}{u}" if budget else ""
-        print(f"pls  {s.get('label', 'resource')}  ({PLS_URL})   capacity={s.get('capacity', 1)}{extra}")
-        _print_held(held, u, "  ")
-    if waiting:
+        title = "pls"
+        one = {"label": s.get("label", "resource"), "names": [], "tags": [],
+               "capacity": s.get("capacity", 1), "budget": s.get("budget", 0)}
+        groups = [(one, held, False)]
+    def cost(h):
+        return f"  ~{h['cost']:g} {unit}".rstrip() if h.get("cost") else ""
+
+    def eligible(w):
+        return f"  for {', '.join(w.get('eligible', []))}" if cards else ""
+
+    held_tool = max((len(h["tool"]) for h in held), default=0)
+    wait_tool = max((len(w["tool"]) for w in waiting), default=0)
+
+    heads = []
+    for card, holders, is_default in groups:
+        facts = [", ".join(card["names"])] if card["names"] else []
+        facts += card["tags"]
+        if is_default:
+            facts.append("default")
+        if card["capacity"] != 1:
+            facts.append(f"capacity {card['capacity']}")
+        if card.get("budget"):
+            facts.append(f"budget {card['budget']:g} {unit}".rstrip())
+        head = (paint("●", "33") if holders else paint("○", "32")) + " " + paint(card["label"], "1")
+        if facts:
+            head += "   " + paint(" · ".join(facts), "2")
+        heads.append(head)
+
+    lines = [paint(title, "1") + paint(f" · {PLS_URL}", "2"), ""]
+    head_width = max(map(_visible, heads))
+    for head, (card, holders, _) in zip(heads, groups):
+        live = (usage or {}).get(card.get("device"))
+        lines.append(head + " " * (head_width - _visible(head)) + "   " + live if live else head)
+        if not holders:
+            lines.append("    " + paint("free", "32"))
+        for h in holders:
+            lines.append(f"    {h['user']:<12} {h['tool']:<{held_tool}}  {_fmt(h['held_s']):>6}{cost(h)}")
+
+    lines.append("")
+    if not waiting:
+        lines.append(paint("queue", "1") + "  " + paint("nobody waiting", "2"))
+    else:
+        lines.append(paint("queue", "1"))
         for i, w in enumerate(waiting, 1):
-            line = f"  WAIT #{i:<2} {w['user']:<12} {w['tool']:<38} {w['priority']:<12} ({_fmt(w['waited_s'])})"
-            if cards:
-                line += f"  for {', '.join(w.get('eligible', []))}"
-            print(line)
-    else:
-        print("  WAIT     (nobody)")
+            lines.append(f"  {i:>2}  {w['user']:<12} {w['tool']:<{wait_tool}}  "
+                         f"{w['priority']:<6}  {_fmt(w['waited_s']):>6}" + paint(eligible(w), "2"))
+    return lines
 
 
-def _print_held(held, u, pad):
-    if not held:
-        print(f"{pad}IN USE   (free)")
-    for h in held:
-        cost = f"  ~{h['cost']}{u}" if h.get("cost") else ""
-        print(f"{pad}IN USE   {h['user']:<12} {h['tool']:<38} {_fmt(h['held_s'])}{cost}")
+def _print_status(s, usage=None):
+    print("\n".join(_render_status(s, _wants_color(), usage)))
 
 
 def cmd_status(args):
@@ -86,24 +153,34 @@ def cmd_status(args):
         import json
         print(json.dumps(s, indent=2))
     else:
-        _print_status(s)
+        _print_status(s, _usage(s.get("cards") or []))
     return 0
 
 
 def cmd_watch(args):
+    color = _wants_color()
+    paint = _painter(color)
+    out = sys.stdout
+    out.write("\x1b[?25l\x1b[2J")  # hide the cursor, clear once; each frame then redraws in place
     try:
         while True:
+            width = shutil.get_terminal_size().columns
             try:
                 s = _call("GET", "/status")
-                sys.stdout.write("\x1b[2J\x1b[H")  # clear screen, home cursor
-                print(time.strftime("%H:%M:%S"))
-                _print_status(s)
+                lines = _render_status(s, color, _usage(s.get("cards") or []))
             except Exception as exc:
-                sys.stdout.write("\x1b[2J\x1b[H")
-                print(f"broker unreachable at {PLS_URL} ({exc})")
+                lines = [paint(f"broker unreachable at {PLS_URL} ({exc})", "31")]
+            stamp = paint(time.strftime("%H:%M:%S"), "2")
+            lines[0] += " " * max(2, width - _visible(lines[0]) - _visible(stamp)) + stamp
+            lines += ["", paint(f"refreshing every {args.interval:g}s, Ctrl-C to stop", "2")]
+            out.write("\x1b[H" + "".join(line + "\x1b[K\n" for line in lines) + "\x1b[J")
+            out.flush()
             time.sleep(args.interval)
     except KeyboardInterrupt:
         return 0
+    finally:
+        out.write("\x1b[?25h")
+        out.flush()
 
 
 def cmd_run(args, cmd):
