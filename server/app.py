@@ -14,6 +14,7 @@ by name, by tag or with ``any``. See the README.
   GET  /healthz                                         -> {ok}
 """
 import json
+import math
 import os
 import re
 import sys
@@ -23,14 +24,15 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def _load_env_file():
-    """Populate os.environ from a .env file (KEY=VALUE lines; '#' comments; optional quotes;
-    optional 'export '), WITHOUT overriding variables already set in the real environment.
-    Looked up at $PLS_ENV_FILE, else <install root>/.env. A missing/unreadable file is ignored."""
+def _settings():
+    """The settings: a .env file (KEY=VALUE lines; '#' comments; optional quotes; optional
+    'export ') under the real environment, which wins. The file is $PLS_ENV_FILE, else
+    <install root>/.env; a missing or unreadable one is ignored. os.environ is left alone."""
     path = os.environ.get("PLS_ENV_FILE")
     if not path:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(root, ".env")
+    found = {}
     try:
         with open(path, encoding="utf-8") as fh:
             for raw in fh:
@@ -41,25 +43,26 @@ def _load_env_file():
                     line = line[len("export "):]
                 key, sep, val = line.partition("=")
                 if sep:
-                    os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+                    found[key.strip()] = val.strip().strip('"').strip("'")
     except OSError:
         pass
+    return {**found, **os.environ}
 
 
-_load_env_file()
-
-HOST = os.getenv("PLS_HOST", "0.0.0.0")
-PORT = int(os.getenv("PLS_PORT", "5555"))
-CAPACITY = int(os.getenv("PLS_CAPACITY", "1"))
-BUDGET = float(os.getenv("PLS_BUDGET", "0"))                 # 0 = ignore cost, gate on capacity only
-HEARTBEAT_TTL = float(os.getenv("PLS_HEARTBEAT_TTL", "30"))
-DONE_RETAIN = float(os.getenv("PLS_DONE_RETAIN", "600"))
-LABEL = os.getenv("PLS_LABEL", "shared resource")
-UNIT = os.getenv("PLS_UNIT", "")
+_SETTINGS = _settings()
+HOST = _SETTINGS.get("PLS_HOST", "0.0.0.0")
+PORT = int(_SETTINGS.get("PLS_PORT", "5555"))
+CAPACITY = int(_SETTINGS.get("PLS_CAPACITY", "1"))
+BUDGET = float(_SETTINGS.get("PLS_BUDGET", "0"))               # 0 = ignore cost, gate on capacity only
+HEARTBEAT_TTL = float(_SETTINGS.get("PLS_HEARTBEAT_TTL", "30"))
+DONE_RETAIN = float(_SETTINGS.get("PLS_DONE_RETAIN", "600"))
+LABEL = _SETTINGS.get("PLS_LABEL", "shared resource")
+UNIT = _SETTINGS.get("PLS_UNIT", "")
 PRIORITIES = {"high": 0, "normal": 10, "low": 20}            # lower = served first
 _NS = 1_000_000_000
 _LIVE = ("waiting", "held")
 _CARD_KEY = re.compile(r"PLS_CARD_(\d+)_(NAMES|DEVICE|LABEL|TAGS|CAPACITY|BUDGET)$")
+_MAX_BODY = 64 * 1024
 
 
 def _boot_id():
@@ -84,7 +87,7 @@ def _split(value):
 def _configure(env):
     """Load the cards, the default set and the state file from ``env``. Raises ValueError on a
     config that would let a selector mean two things."""
-    global CARDS, DEFAULT, STATE_FILE, _SELECTORS
+    global CARDS, DEFAULT, STATE_FILE, _NAMES, _SELECTORS
     raw = {}
     for key, val in env.items():
         if key.startswith("PLS_CARD_"):
@@ -127,6 +130,7 @@ def _configure(env):
     # "use PLS_CAPACITY / PLS_BUDGET", read at scheduling time.
     CARDS = cards or [{"id": None, "names": [], "tags": [], "label": None, "device": None,
                        "capacity": None, "budget": None}]
+    _NAMES = names
     _SELECTORS = {k: [v] for k, v in names.items()}
     _SELECTORS.update(tags)
     _SELECTORS["any"] = [c["id"] for c in CARDS]
@@ -170,6 +174,34 @@ def _eligible(tokens):
     return [c["id"] for c in CARDS if c["id"] in picked]
 
 
+def _cost(value, eligible=()):
+    """A ticket's cost, refused unless it is a finite number >= 0 that fits the budget of at
+    least one of the ``eligible`` cards."""
+    try:
+        cost = float(value or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        cost = math.nan
+    if not math.isfinite(cost) or cost < 0:
+        raise ValueError("cost must be a finite number >= 0")
+    budgets = [_limits(c)[1] for c in CARDS if c["id"] in eligible]
+    if budgets and all(0 < b < cost for b in budgets):
+        raise ValueError(f"cost {cost:g} is over the budget of every card it can use "
+                         f"({', '.join(f'{b:g}' for b in budgets)})")
+    return cost
+
+
+def _held_card(saved):
+    """The configured card a saved held ticket is on, matched by its device UUID or any name."""
+    if not _has_cards():
+        if saved.get("card") is None:
+            return None
+    else:
+        for key in (saved.get("device"), saved.get("card")):
+            if isinstance(key, str) and key.lower() in _NAMES:
+                return _NAMES[key.lower()]
+    raise ValueError(f"card {saved.get('card')} is no longer configured")
+
+
 _configure({})
 
 
@@ -209,7 +241,7 @@ def _schedule():
         for card in CARDS:
             if card["id"] in t["eligible"] and _fits(card, t, held):
                 now = _now()
-                t.update(state="held", card=card["id"], granted_at=now, last_seen=now)
+                t.update(state="held", card=card["id"], device=card["device"], granted_at=now)
                 held.append(t)
                 break
     _save()
@@ -252,9 +284,28 @@ def _save():
         print(f"pls: cannot save tickets to {STATE_FILE}: {exc}", file=sys.stderr, flush=True)
 
 
+def _revive(saved, now):
+    """A saved ticket rebuilt field by field with a fresh TTL; raises on anything malformed. A
+    held one keeps its card while that card is configured under any name or its UUID."""
+    state, prio_name = saved["state"], saved["priority_name"]
+    if state not in _LIVE:
+        raise ValueError(f"unknown state {state!r}")
+    t = {"id": str(saved["id"]), "user": str(saved["user"]), "tool": str(saved["tool"]),
+         "cost": _cost(saved["cost"]), "priority": PRIORITIES[prio_name], "priority_name": prio_name,
+         "on": _tokens(saved["on"]), "card": None, "device": None, "state": state,
+         "created_at": int(saved["created_at"]), "granted_at": None, "last_seen": now}
+    if state == "held":
+        t["card"], t["granted_at"] = _held_card(saved), int(saved["granted_at"])
+        t["device"] = next(c["device"] for c in CARDS if c["id"] == t["card"])
+        t["eligible"] = [t["card"]]
+    else:
+        t["eligible"] = _eligible(t["on"])
+    return t
+
+
 def _load():
-    """Reload the live tickets a previous run saved, each with a fresh TTL. Their timestamps are
-    CLOCK_MONOTONIC readings, which only stay meaningful until the next reboot."""
+    """Reload the live tickets a previous run saved. Their timestamps are CLOCK_MONOTONIC
+    readings, which only stay meaningful until the next reboot."""
     if not STATE_FILE:
         return
     try:
@@ -265,19 +316,20 @@ def _load():
     except (OSError, ValueError) as exc:
         print(f"pls: ignoring unreadable {STATE_FILE}: {exc}", file=sys.stderr, flush=True)
         return
+    if not isinstance(saved, dict) or not isinstance(saved.get("tickets") or [], list):
+        print(f"pls: ignoring {STATE_FILE}: not a saved ticket list", file=sys.stderr, flush=True)
+        return
     if saved.get("boot_id") != BOOT_ID:
         print("pls: discarding tickets saved before the last reboot", flush=True)
         return
-    now, ids, kept = _now(), [c["id"] for c in CARDS], 0
-    for t in saved.get("tickets") or []:
+    now, kept = _now(), 0
+    for entry in saved.get("tickets") or []:
         try:
-            t["eligible"] = _eligible(t["on"])
-            if t["state"] == "held" and t["card"] not in ids:
-                raise ValueError(f"card {t['card']} is no longer configured")
-        except (KeyError, TypeError, ValueError) as exc:
-            print(f"pls: dropping saved ticket {t.get('id')}: {exc}", file=sys.stderr, flush=True)
+            t = _revive(entry, now)
+        except Exception as exc:
+            tid = entry.get("id") if isinstance(entry, dict) else None
+            print(f"pls: dropping saved ticket {tid}: {exc!r}", file=sys.stderr, flush=True)
             continue
-        t["last_seen"] = now
         _tickets[t["id"]] = t
         kept += 1
     print(f"pls: reloaded {kept} ticket(s) from {STATE_FILE}", flush=True)
@@ -321,10 +373,12 @@ def _status_payload():
 class Handler(BaseHTTPRequestHandler):
     server_version = "pls/1.0"
     protocol_version = "HTTP/1.1"
+    timeout = 15
 
     def log_message(self, *_a):  # keep the journal quiet
         pass
 
+    # Never call this with _lock held: a client that stops reading would freeze the broker.
     def _send(self, code, payload, ctype="application/json"):
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.send_response(code)
@@ -334,18 +388,34 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json(self):
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if not length:
+        """The request body as a JSON object ({} when empty); raises ValueError otherwise."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("bad Content-Length") from None
+        if not 0 <= length <= _MAX_BODY:
+            raise ValueError(f"Content-Length must be 0 to {_MAX_BODY}")
+        try:
+            raw = self.rfile.read(length)
+        except OSError:
+            raise ValueError("the request body could not be read") from None
+        if len(raw) < length:
+            raise ValueError("the request body is shorter than its Content-Length")
+        if not raw.strip():
             return {}
         try:
-            return json.loads(self.rfile.read(length).decode() or "{}")
-        except Exception:
-            return {}
+            body = json.loads(raw.decode())
+        except (ValueError, RecursionError) as exc:
+            raise ValueError(f"the request body is not JSON: {exc}") from None
+        if not isinstance(body, dict):
+            raise ValueError("the request body must be a JSON object")
+        return body
 
     def do_GET(self):
         if self.path == "/status":
             with _lock:
-                self._send(200, _status_payload())
+                body = json.dumps(_status_payload()).encode()
+            self._send(200, body)
         elif self.path in ("/", "/index.html"):
             self._send(200, _PAGE.encode(), ctype="text/html; charset=utf-8")
         elif self.path == "/healthz":
@@ -356,17 +426,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parts = self.path.strip("/").split("/")
         if self.path == "/acquire":
-            body = self._read_json()
+            try:
+                body = self._read_json()
+                on = _tokens(body.get("on"))
+                eligible = _eligible(on)
+                cost = _cost(body.get("cost"), eligible)
+            except (TypeError, ValueError) as exc:
+                self.close_connection = True  # an unread or partial body would garble the next request
+                self._send(400, {"error": str(exc)})
+                return
             prio_name = str(body.get("priority") or "normal")
             if prio_name not in PRIORITIES:
                 prio_name = "normal"
-            try:
-                on = _tokens(body.get("on"))
-                eligible = _eligible(on)
-                cost = float(body.get("cost") or 0.0)
-            except (TypeError, ValueError) as exc:
-                self._send(400, {"error": str(exc)})
-                return
             with _lock:
                 now = _now()
                 t = {
@@ -379,6 +450,7 @@ class Handler(BaseHTTPRequestHandler):
                     "on": on,
                     "eligible": eligible,
                     "card": None,
+                    "device": None,
                     "state": "waiting",
                     "created_at": now,
                     "granted_at": None,
@@ -386,23 +458,25 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 _tickets[t["id"]] = t
                 _schedule()
-                self._send(200, _state_of(t))
+                reply = _state_of(t)
+            self._send(200, reply)
         elif len(parts) == 2 and parts[0] == "heartbeat":
             with _lock:
                 t = _tickets.get(parts[1])
                 if t and t["state"] in _LIVE:
                     t["last_seen"] = _now()
                     _schedule()
-                    self._send(200, _state_of(t))
+                    reply = _state_of(t)
                 else:
-                    self._send(200, {"id": parts[1], "state": "expired", "position": None})
+                    reply = {"id": parts[1], "state": "expired", "position": None}
+            self._send(200, reply)
         elif len(parts) == 2 and parts[0] == "release":
             with _lock:
                 t = _tickets.get(parts[1])
                 if t:
                     t.update(state="done", ended_at=_now(), last_seen=_now())
                     _schedule()
-                self._send(200, {"ok": True})
+            self._send(200, {"ok": True})
         else:
             self._send(404, {"error": "not found"})
 
@@ -626,7 +700,7 @@ setInterval(tick, 2000);
 
 def main():
     try:
-        _configure(os.environ)
+        _configure(_SETTINGS)
     except ValueError as exc:
         sys.exit(f"pls: refusing to start: {exc}")
     with _lock:

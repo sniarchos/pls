@@ -17,6 +17,8 @@ Restart=always
 RestartSec=2
 # Live tickets are saved to /var/lib/pls/tickets.json ($STATE_DIRECTORY) and reloaded on restart.
 StateDirectory=pls
+# tickets.json holds job names, which can carry secrets: readable by the service alone.
+UMask=0077
 
 # --- light hardening (the state directory above is the only place the broker writes) ---
 NoNewPrivileges=true

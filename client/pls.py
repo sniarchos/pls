@@ -28,14 +28,16 @@ import urllib.error
 import urllib.request
 
 
-def _load_env_file():
-    """Populate os.environ from a .env file (KEY=VALUE lines; '#' comments; optional quotes;
-    optional 'export '), WITHOUT overriding variables already set in the real environment.
-    Looked up at $PLS_ENV_FILE, else <install root>/.env. A missing/unreadable file is ignored."""
+def _settings():
+    """The settings: a .env file (KEY=VALUE lines; '#' comments; optional quotes; optional
+    'export ') under the real environment, which wins. The file is $PLS_ENV_FILE, else
+    <install root>/.env; a missing or unreadable one is ignored. os.environ is left alone, so
+    the file's settings never reach the processes this one starts."""
     path = os.environ.get("PLS_ENV_FILE")
     if not path:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(root, ".env")
+    found = {}
     try:
         with open(path, encoding="utf-8") as fh:
             for raw in fh:
@@ -46,21 +48,21 @@ def _load_env_file():
                     line = line[len("export "):]
                 key, sep, val = line.partition("=")
                 if sep:
-                    os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+                    found[key.strip()] = val.strip().strip('"').strip("'")
     except OSError:
         pass
+    return {**found, **os.environ}
 
 
-_load_env_file()
-
+_SETTINGS = _settings()
 # PLS_PORT is the single knob: the server listens on it and the client targets it, so they can't
 # drift. Set PLS_URL explicitly only for a remote/containerized broker (e.g. host.docker.internal).
-_PORT = os.getenv("PLS_PORT", "5555")
-PLS_URL = os.getenv("PLS_URL", f"http://127.0.0.1:{_PORT}")
-_POLL = float(os.getenv("PLS_POLL", "2"))
-_BEAT = float(os.getenv("PLS_BEAT", "10"))
-_GRACE = float(os.getenv("PLS_CONNECT_GRACE", "15"))
-_REQUIRED = os.getenv("PLS_REQUIRED", "false").lower() in ("1", "true", "yes")
+_PORT = _SETTINGS.get("PLS_PORT", "5555")
+PLS_URL = _SETTINGS.get("PLS_URL", f"http://127.0.0.1:{_PORT}")
+_POLL = float(_SETTINGS.get("PLS_POLL", "2"))
+_BEAT = float(_SETTINGS.get("PLS_BEAT", "10"))
+_GRACE = float(_SETTINGS.get("PLS_CONNECT_GRACE", "15"))
+_REQUIRED = _SETTINGS.get("PLS_REQUIRED", "false").lower() in ("1", "true", "yes")
 
 Grant = collections.namedtuple("Grant", "ticket card label device")
 
@@ -94,25 +96,25 @@ def _acquire(user, tool, cost, priority, on):
         raise PlsError(msg or f"broker refused the lease (HTTP {exc.code})") from None
 
 
-def _acquire_resilient(user, tool, cost, priority, on):
+def _acquire_resilient(user, tool, cost, priority, on, cancel=None):
     """Acquire a ticket, tolerating a broker that is briefly down. Returns the ticket, or
-    ``None`` to signal "run unguarded" (only when the broker is optional)."""
+    ``None`` to signal "run unguarded" (only when the broker is optional) or that ``cancel``, a
+    threading.Event, was set."""
+    cancel = cancel or threading.Event()
     deadline = time.monotonic_ns() + int(_GRACE * 1_000_000_000)
-    while True:
+    while not cancel.is_set():
         try:
             return _acquire(user, tool, cost, priority, on)
         except PlsError:
             raise
         except Exception as exc:  # connection refused, DNS, timeout, ...
-            if _REQUIRED:
-                time.sleep(2)
-                continue
-            if time.monotonic_ns() > deadline:
+            if not _REQUIRED and time.monotonic_ns() > deadline:
                 sys.stderr.write(
                     f"[pls] WARNING: broker unreachable ({exc}); running WITHOUT a lease\n"
                 )
                 return None
-            time.sleep(2)
+            cancel.wait(2)
+    return None
 
 
 def _poll(t, args):
@@ -127,17 +129,24 @@ def _poll(t, args):
     return nxt
 
 
-def _beat_once(tid):
-    """One heartbeat while holding; False once the broker has dropped the lease."""
+def _beat_once(tid, done):
+    """One heartbeat while holding; False once the broker has dropped the lease. ``done`` is set
+    before our own release, which this beat may have raced."""
     try:
         state = _call("POST", "/heartbeat/" + tid).get("state")
     except Exception:
         return True  # a missed beat is harmless; the broker allows PLS_HEARTBEAT_TTL of silence
     if state == "expired":
-        sys.stderr.write(f"[pls] WARNING: lease {tid} expired while held; "
-                         "the work carries on without one\n")
+        if not done.is_set():
+            sys.stderr.write(f"[pls] WARNING: lease {tid} expired while held; "
+                             "the work carries on without one\n")
         return False
     return True
+
+
+def _release(tid):
+    with contextlib.suppress(Exception):
+        _call("POST", "/release/" + tid)
 
 
 def _grant(t):
@@ -153,11 +162,16 @@ def lease_sync(tool="?", cost=0.0, priority="normal", user=None, on_wait=None, o
     queue position)."""
     args = (user or os.getenv("USER") or "unknown", tool, cost, priority, on)
     t = _acquire_resilient(*args)
-    while t is not None and t.get("state") != "held":
-        if on_wait:
-            on_wait(t)
-        time.sleep(_POLL)
-        t = _poll(t, args)
+    try:
+        while t is not None and t.get("state") != "held":
+            if on_wait:
+                on_wait(t)
+            time.sleep(_POLL)
+            t = _poll(t, args)
+    except BaseException:
+        if t is not None:
+            _release(t["id"])
+        raise
     if t is None:
         yield None  # fail-open: run unguarded
         return
@@ -166,7 +180,7 @@ def lease_sync(tool="?", cost=0.0, priority="normal", user=None, on_wait=None, o
     stop = threading.Event()
 
     def _beat():
-        while not stop.wait(_BEAT) and _beat_once(grant.ticket):
+        while not stop.wait(_BEAT) and _beat_once(grant.ticket, stop):
             pass
 
     threading.Thread(target=_beat, daemon=True).start()
@@ -174,8 +188,7 @@ def lease_sync(tool="?", cost=0.0, priority="normal", user=None, on_wait=None, o
         yield grant
     finally:
         stop.set()
-        with contextlib.suppress(Exception):
-            _call("POST", "/release/" + grant.ticket)
+        _release(grant.ticket)
 
 
 @contextlib.asynccontextmanager
@@ -184,30 +197,51 @@ async def lease(tool="?", cost=0.0, priority="normal", user=None, on=None):
     to a worker thread; the waiting itself is native ``asyncio.sleep`` so the loop stays free."""
     import asyncio
 
-    async def to_thread(fn, *a):  # asyncio.to_thread is 3.9+; this keeps us at 3.7+
-        return await asyncio.get_running_loop().run_in_executor(None, fn, *a)
+    loop = asyncio.get_running_loop()
+    call = None
 
-    args = (user or os.getenv("USER") or "app", tool, cost, priority, on)
-    t = await to_thread(_acquire_resilient, *args)
-    while t is not None and t.get("state") != "held":
-        await asyncio.sleep(_POLL)
-        t = await to_thread(_poll, t, args)
+    async def to_thread(fn, *a):  # asyncio.to_thread is 3.9+; this keeps us at 3.7+
+        return await loop.run_in_executor(None, fn, *a)
+
+    async def step(fn, *a):
+        # Shielded, so a cancelled wait can still learn which ticket the call in flight left.
+        nonlocal call
+        call = loop.run_in_executor(None, fn, *a)
+        return await asyncio.shield(call)
+
+    cancel = threading.Event()
+    args = (user or os.getenv("USER") or "app", tool, cost, priority, on, cancel)
+    t = None
+    try:
+        t = await step(_acquire_resilient, *args)
+        while t is not None and t.get("state") != "held":
+            await asyncio.sleep(_POLL)
+            t = await step(_poll, t, args)
+    except BaseException:
+        cancel.set()  # a worker still retrying an unreachable broker stops
+        with contextlib.suppress(BaseException):
+            await asyncio.wait({call}, timeout=10)  # a broker call times out after 10 s anyway
+            t = call.result()
+        if t is not None:
+            await to_thread(_release, t["id"])
+        raise
     if t is None:
         yield None  # fail-open
         return
 
     grant = _grant(t)
+    stop = threading.Event()
 
     async def _beat():
         while True:
             await asyncio.sleep(_BEAT)
-            if not await to_thread(_beat_once, grant.ticket):
+            if not await to_thread(_beat_once, grant.ticket, stop):
                 return
 
     beat = asyncio.create_task(_beat())
     try:
         yield grant
     finally:
+        stop.set()
         beat.cancel()
-        with contextlib.suppress(Exception):
-            await to_thread(_call, "POST", "/release/" + grant.ticket)
+        await to_thread(_release, grant.ticket)

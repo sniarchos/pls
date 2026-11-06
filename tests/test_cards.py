@@ -6,6 +6,8 @@ import importlib.util
 import io
 import json
 import os
+import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,9 +23,9 @@ for _p in (HERE, os.path.join(ROOT, "server"), os.path.join(ROOT, "client")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from _helpers import start_broker, post, get, free_port  # noqa: E402  (first: see _helpers)
 import app  # noqa: E402
 import pls as client  # noqa: E402
-from _helpers import start_broker, post, get, free_port  # noqa: E402
 
 BIN = os.path.join(ROOT, "bin", "pls")
 MAXQ = "GPU-7c742dd2-98c6-60e3-e7a2-5f9fdaa28e52"
@@ -209,6 +211,18 @@ class PlacementTests(BrokerCase):
         self.assertEqual(self.acquire("any", cost=30)["card"]["id"], "maxq")  # 90 <= 96
         self.assertEqual(self.acquire("any", cost=10)["state"], "waiting")    # 100 and 50
 
+    def test_a_cost_over_every_eligible_budget_is_refused(self):
+        app._configure(dict(TWO, PLS_CARD_1_BUDGET="96", PLS_CARD_2_BUDGET="48"))
+        for on, cost in (("ada", 60), ("any", 100)):
+            with self.subTest(on=on), self.assertRaises(urllib.error.HTTPError) as cm:
+                self.acquire(on, cost=cost)
+            self.assertEqual(cm.exception.code, 400)
+            self.assertIn("over the budget of every card it can use",
+                          json.loads(cm.exception.read().decode())["error"])
+        self.assertEqual(self.acquire("any", cost=60)["card"]["id"], "maxq")
+        app._configure(dict(TWO, PLS_CARD_1_BUDGET="96"))  # the Ada has no budget: anything fits
+        self.assertEqual(self.acquire("ada", cost=500)["card"]["id"], "ada")
+
     def test_grant_and_heartbeat_name_the_card(self):
         held = self.acquire("blackwell")
         expect = {"id": "maxq", "label": "RTX PRO 6000 Blackwell Max-Q", "device": MAXQ}
@@ -327,7 +341,92 @@ class PersistenceTests(BrokerCase):
         kept = self.acquire("ada")
         err = self.restart(ONE)
         self.assertEqual(list(app._tickets), [kept["id"]])
-        self.assertIn("unknown card or tag 'maxq'", err)
+        self.assertIn("card maxq is no longer configured", err)
+
+    def test_a_holder_keeps_its_card_under_any_name_or_its_uuid(self):
+        renamed = {
+            "alias removed": dict(TWO, PLS_CARD_1_NAMES="maxq"),
+            "names reordered": dict(TWO, PLS_CARD_1_NAMES="blackwell, maxq"),
+            "renamed, same UUID": dict(TWO, PLS_CARD_1_NAMES="mq", PLS_CARD_1_TAGS="b"),
+        }
+        for why, env in renamed.items():
+            with self.subTest(why):
+                self.restart(TWO)
+                app._tickets.clear()
+                held = self.acquire("blackwell", tool="running")
+                waiter = self.acquire("sm_120", tool="next")
+                err = self.restart(env)
+                t = app._tickets[held["id"]]
+                self.assertEqual((t["state"], t["eligible"], t["card"]), ("held", [t["card"]], app.CARDS[0]["id"]))
+                self.assertEqual(t["device"], MAXQ)
+                self.assertEqual(app._tickets.get(waiter["id"], {}).get("state", "dropped"),
+                                 "dropped" if why == "renamed, same UUID" else "waiting", err)
+
+    def test_a_holder_saved_without_a_uuid_keeps_its_card_by_id(self):
+        no_uuids = {k: v for k, v in TWO.items() if not k.endswith("_DEVICE")}
+        cases = {  # (config when granted, config after the restart, the card it should keep)
+            "names reordered": (no_uuids, dict(no_uuids, PLS_CARD_1_NAMES="blackwell, maxq"), "blackwell"),
+            "alias removed": (TWO, dict(TWO, PLS_CARD_1_NAMES="maxq"), "maxq"),
+            "first name removed": (TWO, dict(TWO, PLS_CARD_1_NAMES="blackwell"), None),
+        }
+        for why, (before, after, kept) in cases.items():
+            with self.subTest(why):
+                self.restart(before)
+                app._tickets.clear()
+                held = self.acquire("blackwell", tool="running")
+                with open(self.path) as fh:
+                    saved = json.load(fh)
+                for t in saved["tickets"]:
+                    del t["device"]  # the format a broker that saved no UUIDs wrote
+                with open(self.path, "w") as fh:
+                    json.dump(saved, fh)
+                self.restart(after)
+                self.assertEqual((app._tickets.get(held["id"]) or {}).get("card"), kept)
+
+    def test_a_malformed_state_file_drops_only_what_is_malformed(self):
+        good = self.acquire("ada", tool="good")
+        with open(self.path) as fh:
+            saved = json.load(fh)
+        bad = [
+            "oops", ["a", "list"], None,
+            {k: v for k, v in saved["tickets"][0].items() if k != "id"},
+            {k: v for k, v in saved["tickets"][0].items() if k != "created_at"},
+            dict(saved["tickets"][0], id="nan", cost=float("nan")),
+            dict(saved["tickets"][0], id="state", state="weird"),
+        ]
+        with open(self.path, "w") as fh:
+            json.dump(dict(saved, tickets=bad + saved["tickets"]), fh)
+        err = self.restart(TWO)
+        self.assertEqual(list(app._tickets), [good["id"]])
+        self.assertEqual(err.count("dropping saved ticket"), len(bad))
+        for body in ("[]", '"x"', json.dumps({"boot_id": app.BOOT_ID, "tickets": {"a": 1}})):
+            with self.subTest(body=body):
+                with open(self.path, "w") as fh:
+                    fh.write(body)
+                self.assertIn("not a saved ticket list", self.restart(TWO))
+                self.assertEqual(app._tickets, {})
+
+    def test_the_broker_starts_on_a_malformed_state_file(self):
+        with open(self.path, "w") as fh:
+            fh.write(json.dumps({"boot_id": app.BOOT_ID, "tickets": ["oops"]}))
+        env = dict(os.environ, PLS_PORT=str(free_port()), PLS_HOST="127.0.0.1",
+                   PLS_STATE_FILE=self.path, **TWO)
+        p = subprocess.Popen([sys.executable, os.path.join(ROOT, "server", "app.py")], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(100):
+                try:
+                    if get(f"http://127.0.0.1:{env['PLS_PORT']}", "/healthz") == {"ok": True}:
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                self.fail("the broker never answered")
+        finally:
+            p.terminate()
+            out, err = p.communicate(timeout=5)
+        self.assertIn("dropping saved ticket None", err)
+        self.assertIn("reloaded 0 ticket(s)", out)
 
     def test_release_is_saved(self):
         self.release(self.acquire("maxq"))
@@ -489,6 +588,57 @@ class CliTests(BrokerCase):
             self.assertIn("Not started.", err)
             self.assertTrue(self.nothing_queued())
 
+    def test_closed_stdin_is_not_an_answer(self):
+        p = subprocess.run(["sh", "-c", 'exec 0<&-; exec "$0" "$1" run -- echo ran', sys.executable, BIN],
+                           env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual((p.returncode, p.stdout), (2, ""))
+        self.assertIn("Not started.", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertTrue(self.nothing_queued())
+
+    def test_ctrl_c_while_the_question_reads_the_board(self):
+        quiet = mock.patch.object(self.httpd, "handle_error")  # its reply finds pls gone
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        with app._lock:  # /status waits on the lock
+            p = subprocess.Popen([sys.executable, BIN, "run", "--", "echo", "ran"], env=self.env,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True)
+            time.sleep(1.0)
+            p.send_signal(signal.SIGINT)
+            out, err = p.communicate(timeout=10)
+        time.sleep(0.3)
+        self.assertEqual((p.returncode, out), (130, ""))
+        self.assertIn("Not started.", err)
+        self.assertNotIn("Traceback", err)
+
+    @unittest.skipUnless(hasattr(os, "openpty"), "needs a pseudo-terminal")
+    def test_ctrl_c_at_the_question(self):
+        primary, secondary = os.openpty()
+        try:
+            p = subprocess.Popen([sys.executable, BIN, "run", "--", "echo", "ran"], env=self.env,
+                                 stdin=secondary, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            seen = b""
+            while b"[y/N]" not in seen:
+                ready, _, _ = select.select([p.stderr], [], [], 10)
+                self.assertTrue(ready, seen)
+                seen += os.read(p.stderr.fileno(), 4096)
+            p.send_signal(signal.SIGINT)
+            out, err = p.communicate(timeout=10)
+        finally:
+            os.close(secondary)
+            os.close(primary)
+        self.assertEqual((p.returncode, out), (130, b""))
+        self.assertIn(b"Not started.", err)
+        self.assertNotIn(b"Traceback", err)
+        self.assertTrue(self.nothing_queued())
+
+    def test_a_cost_no_card_can_take_is_an_error(self):
+        app._configure(dict(TWO, PLS_CARD_2_BUDGET="48"))
+        p = self.pls("run", "--on", "ada", "--cost", "60", "--", "echo", "ran")
+        self.assertEqual((p.returncode, p.stdout), (2, ""))
+        self.assertIn("error: cost 60 is over the budget of every card it can use (48)", p.stderr)
+
     def test_on_never_asks(self):
         p = self.pls("run", "--on", "ada", "--", "sh", "-c", 'echo "$PLS_CARD"')
         self.assertEqual((p.returncode, p.stdout.strip()), (0, "ada"))
@@ -522,6 +672,8 @@ class CliTests(BrokerCase):
         self.assertEqual(p.stdout.strip(), "unset|unset")
 
     def test_status_shows_each_card(self):
+        self.addCleanup(setattr, app, "UNIT", app.UNIT)
+        app.UNIT = "GB"
         self.acquire("maxq", tool="bigjob", cost=60)
         self.acquire("sm_120", tool="nextjob")
         self.env["PATH"] = ""  # no nvidia-smi, so no live usage to vary the output

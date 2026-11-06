@@ -1,9 +1,17 @@
-"""Shared test helpers (stdlib only). Not collected by unittest (name isn't test_*)."""
+"""Shared test helpers (stdlib only). Not collected by unittest (name isn't test_*).
+
+Import this before the broker or the client: it keeps the tests away from any .env (a checkout's
+targets the live broker) and from PLS_* settings in the caller's environment."""
 import json
+import os
 import socket
 import threading
 import urllib.request
 from http.server import ThreadingHTTPServer
+
+for _key in [k for k in os.environ if k.startswith("PLS_")]:
+    del os.environ[_key]
+os.environ["PLS_ENV_FILE"] = os.devnull
 
 
 def free_port():

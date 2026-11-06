@@ -30,7 +30,8 @@ pls status
 It's a coat-check with a fixed number of hooks. You `acquire` -> get a numbered ticket
 (instantly: _"you're #2"_). You poll `heartbeat` in a short local loop until it says `held`;
 _then_ you use the resource. While working you keep heart-beating; when done you `release`. Stop
-heart-beating (crash, Ctrl-C) and the broker reaps your ticket after `PLS_HEARTBEAT_TTL` seconds.
+heart-beating (a crash, say) and the broker reaps your ticket after `PLS_HEARTBEAT_TTL` seconds,
+waiting or held. Leaving the queue (Ctrl-C, a cancelled task) releases the ticket at once.
 
 `PLS_CAPACITY` (default 1) is how many jobs may hold the resource at once. Set it >1 plus a
 `PLS_BUDGET` to let several (small) jobs co-reside while their summed `--cost` fits the budget
@@ -77,8 +78,13 @@ CUDA's default order is "fastest first", so `0` can mean two different cards.
 Live tickets are written to `PLS_STATE_FILE`, or to `$STATE_DIRECTORY/tickets.json` under
 systemd (the unit sets `StateDirectory=pls`, so `/var/lib/pls/tickets.json`). On start pls
 reloads them, holders keep their cards, and every ticket gets a fresh TTL, so jobs that kept
-heart-beating carry on as if nothing happened. Tickets saved before a reboot are discarded (pls
-compares the kernel's boot ID): their jobs died with the machine.
+heart-beating carry on as if nothing happened. A holder is saved with the UUID of its card and
+the card's id (its first name when granted), and keeps the card that one of them still names: the
+UUID first, then the id, each matched against every name and UUID now configured. A holder saved
+without a UUID matches by id alone, so it is dropped if that name is gone. A waiting ticket for a
+card or tag that no longer exists, and any malformed entry, is dropped and logged. Tickets saved
+before a reboot are discarded (pls compares the kernel's boot ID): their jobs died with the
+machine.
 
 ## Layout
 
@@ -118,16 +124,18 @@ pls status
 ```
 
 The installer never overwrites an existing `/opt/pls/.env`, so add card settings to it by hand,
-then `sudo systemctl restart pls`. Restart while `pls status` shows no lease if you change cards:
-a saved ticket for a card or tag that no longer exists is dropped at start.
+then `sudo systemctl restart pls`. If you remove a card, restart while `pls status` shows no lease
+on it (see Restarts). The unit runs the broker with `UMask=0077`, so `tickets.json`, which holds
+the job names, is readable by the service alone.
 
 ## Configuration
 
 Everything is configured by environment variables, which can be set in a **`.env` file** at the
 install root (`/opt/pls/.env`, or `$PLS_ENV_FILE`). The daemon, the CLI, and the embedded client
-all read it on startup; **real environment variables override the file**. Copy `.env.example` to
-`.env` and edit. Comments go on their own lines. Example (run the broker on a different port with
-a custom UI label and unit):
+all read it on startup; **real environment variables override the file**. The file's settings
+stay inside pls: commands that `pls run` starts, and an app that embeds the client, don't see
+them in their environment. Copy `.env.example` to `.env` and edit. Comments go on their own lines.
+Example (run the broker on a different port with a custom UI label and unit):
 
 ```ini
 # .env
@@ -170,7 +178,7 @@ makes the lease mandatory instead of failing open when the broker is down.
 ## CLI
 
 ```
-pls run [--on CARD] [--cost N] [--prio low|normal|high] [--tool LABEL] [--user U] -- CMD...
+pls run [--on CARD] [--yes] [--cost N] [--prio low|normal|high] [--tool LABEL] [--user U] -- CMD...
 pls status [--json]
 pls watch [--interval S]
 ```
@@ -179,13 +187,33 @@ pls watch [--interval S]
   (`--on maxq --on ada`, `--on sm_120,sm_89`). Without it, on a broker with several cards,
   `pls run` explains where the job would go (the broker's `PLS_DEFAULT`, who holds those cards,
   how many wait) and asks before queueing. Where nobody can answer (no terminal on stdin) it
-  stops with the same explanation instead.
+  stops with the same explanation instead. Ctrl-C at the question stops it too (`Not started.`).
 - `--yes`, `-y`: take the default cards without asking.
-- `--cost`: the job's resource cost. Purely informational unless a budget
-  is set; then it gates co-residency. Default `0`.
+- `--cost`: the job's resource cost, a number >= 0. Purely informational unless a budget is set;
+  then it gates co-residency, and a cost over the budget of every card the job can use is refused.
+  Default `0`.
 - `--prio`: serving order is `high`, then `normal`, then `low`. Orders the **waiting** queue (priority, then
   FIFO). Non-preemptive ie, it never bumps a job that's already holding. Default `normal`.
-- `--tool`: the label shown on the board. Defaults to the **full command**.
+- `--tool`: the label shown on the board. Defaults to the **full command**, with the values of
+  `-e`/`--env` pairs and of flags whose name says `token`, `key`, `secret` or `password` shown as
+  `***` (`-e HF_TOKEN=***`, `--api-key ***`). That is best effort: a secret anywhere else in the
+  command (a URL, a header, a positional argument) is shown, so pass `--tool` for such commands.
+
+`pls run` holds the lease until the command exits, and exits with the command's exit code, 128+N
+when signal N ended it. While the command runs:
+
+- Ctrl-C at the terminal reaches the command directly, and pls waits for it to stop.
+- SIGTERM sent to pls is passed on to the command, and so is SIGINT when it did not come from the
+  terminal (pls in the background or without one).
+- A hangup (SIGHUP) is not passed on: it reaches the command directly when the terminal goes.
+  pls keeps waiting.
+- A signal pls was started ignoring (`nohup`, `trap '' INT`) stays ignored, for the command too.
+- A SIGTERM sent to the whole process group (`timeout`, `kill -- -<pgid>`, a service manager
+  stopping a unit) reaches the command twice, directly and from pls; so does a SIGINT sent to the
+  group of a background job (`kill -INT %1`).
+
+While the job is still queued, Ctrl-C, SIGTERM or SIGHUP leaves the queue (`Not started.`, exit
+130, 143 or 129).
 
 When a card is granted, `pls run` says which one and hands it to the command:
 
@@ -198,9 +226,11 @@ When a card is granted, `pls run` says which one and hands it to the command:
 `pls status` and `pls watch` show each card, marked ● when held and ○ when free, with its holders
 and their full job names, then the queue with the cards each ticket can use. Where `nvidia-smi`
 is installed, each card's line also shows its memory in use and its load, which also reveals GPU
-work running without a lease. In a terminal the view is coloured (`NO_COLOR` turns that off);
-piped, it is plain text. `pls watch` redraws in place with the time on the title line. Without
-cards the view shows the one resource.
+work running without a lease. Control characters in user and job names are left out. In a
+terminal the view is coloured (`NO_COLOR` turns that off); piped, it is plain text. `pls watch`
+redraws in place with the time on the title line, so it needs a terminal (pipe `pls status`
+instead), and its `--interval` must be more than 0 seconds. Without cards the view shows the one
+resource.
 
 ## Embedding in your app
 
@@ -218,8 +248,10 @@ async with lease("my_tool_name", cost=42, on="sm_120") as grant:
 Both `lease` and `lease_sync` take `on` (a string or a list; omitted means the default set) and
 yield a `Grant(ticket, card, label, device)`. They yield `None` when failing open, so fall back
 to your usual device then. `card`, `label` and `device` are `None` on a broker without cards.
-An unknown card or tag raises `pls.PlsError`. If the broker drops a lease that is still held
-(say, after a long outage), the client prints a warning and the work carries on.
+An unknown card or tag, or a cost the broker refuses, raises `pls.PlsError`. Leaving either one
+while still queued (an exception, Ctrl-C, a cancelled task) releases the ticket. If the broker
+drops a lease that is still held (say, after a long outage), the client prints a warning and the
+work carries on.
 
 ## Tests
 
@@ -230,9 +262,11 @@ python3 -m unittest tests/test*.py
 ```
 
 Covers the scheduling/admission/reaper logic, the HTTP endpoints, the sync + async client
-(including fail-open and a waiting->granted handoff), and the CLI end-to-end, plus one, two and
-three cards: config refusals, eligibility by name and tag, placement order, the default set,
-restart reload and reboot discard, and `pls run`'s exports and `{device}`.
+(including fail-open, a waiting->granted handoff and leaving the queue), and the CLI end-to-end
+(signals, the question, cost checks), plus one, two and three cards: config refusals, eligibility
+by name and tag, placement order, the default set, restart reload, malformed state files and
+reboot discard, and `pls run`'s exports and `{device}`. The tests read no `.env` and ignore
+`PLS_*` settings in your environment; each one runs its own broker on a free port.
 
 ## HTTP API
 
@@ -247,6 +281,10 @@ GET  /healthz                                    -> {ok}
 
 - `on` is a string or a list of strings, each `any`, a name or a tag, comma-separated or not.
   An unknown one gets a `400` with `{"error": ...}`.
+- `cost` must be a finite number >= 0 within the budget of at least one card the ticket can use
+  (a card without a budget takes any cost); otherwise `400`.
+- The `/acquire` body is a JSON object of at most 64 KiB, or empty for every default. Anything else
+  (not JSON, not an object, shorter than its `Content-Length`) gets a `400`.
 - `card` is `{id, label, device}` once the ticket is held on a card, else `null`.
 - With cards, `held[]` entries gain `card` (its id), `waiting[]` entries gain `on` (what was
   asked) and `eligible` (card ids, in placement order), and `cards[]` lists every card with its
